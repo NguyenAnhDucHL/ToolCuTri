@@ -1,0 +1,14 @@
+# Không commit file macOS-specific
+picker.py
+
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+.env
+
+# Streamlit local config
+.streamlit/
+
+# macOS
+.DS_Store

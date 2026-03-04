@@ -1,0 +1,1012 @@
+import streamlit as st
+import pandas as pd
+import openpyxl
+from openpyxl import load_workbook
+import os
+import re
+import io
+import datetime
+import tempfile
+import random
+import unicodedata
+import subprocess
+
+# Absolute path to the picker helper script (same directory as this file)
+_PICKER_SCRIPT = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'picker.py')
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Utility helpers
+# ─────────────────────────────────────────────────────────────────────────────
+
+ELECTION_DATE = datetime.date(2026, 3, 15)
+
+# Dates for first-time 18-year-old voters (turned 18 between election dates)
+DOB_18_START = datetime.date(2007, 3, 16)
+DOB_18_END   = datetime.date(2008, 3, 15)
+
+# Born before this date → older than 80 as of election day
+DOB_ELDERLY  = datetime.date(1946, 3, 15)
+
+
+def normalize_text(text: str) -> str:
+    """Lowercase + strip + remove diacritics for fuzzy matching."""
+    if not isinstance(text, str):
+        text = str(text)
+    text = unicodedata.normalize("NFD", text)
+    text = "".join(c for c in text if unicodedata.category(c) != "Mn")
+    return text.lower().strip()
+
+
+TOTAL_KEYWORDS = re.compile(
+    r"t[oô]ng\s*(s[oô]|h[ooa]p|c[oô]ng|c[uư] tri)?",
+    re.IGNORECASE | re.UNICODE,
+)
+
+def is_total_row_label(value) -> bool:
+    """Return True if the cell value looks like a 'Tổng' label."""
+    if not value:
+        return False
+    norm = normalize_text(str(value))
+    return bool(TOTAL_KEYWORDS.search(norm))
+
+
+def is_positive_int(value) -> bool:
+    try:
+        return float(value) > 0 and float(value) == int(float(value))
+    except (TypeError, ValueError):
+        return False
+
+
+def extract_numeric(value):
+    """Return int if value is a positive integer, else None."""
+    try:
+        v = float(value)
+        if v > 0:
+            return int(v)
+    except (TypeError, ValueError):
+        pass
+    return None
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Google Drive helpers
+# ─────────────────────────────────────────────────────────────────────────────
+
+def parse_gdrive_folder_id(url: str):
+    """Extract folder ID from a Google Drive folder URL."""
+    match = re.search(r"/folders/([a-zA-Z0-9_-]+)", url)
+    if match:
+        return match.group(1)
+    return None
+
+
+def parse_gdrive_file_id(url: str):
+    """Extract file ID from a Google Drive file URL."""
+    patterns = [
+        r"/file/d/([a-zA-Z0-9_-]+)",
+        r"id=([a-zA-Z0-9_-]+)",
+        r"/d/([a-zA-Z0-9_-]+)",
+    ]
+    for p in patterns:
+        m = re.search(p, url)
+        if m:
+            return m.group(1)
+    return None
+
+
+def download_gdrive_folder(folder_id: str, dest_dir: str) -> list:
+    """Download all .xlsx files from a public Google Drive folder."""
+    try:
+        import gdown
+        url = f"https://drive.google.com/drive/folders/{folder_id}"
+        gdown.download_folder(url, output=dest_dir, quiet=True, use_cookies=False)
+        files = []
+        for root, _, filenames in os.walk(dest_dir):
+            for fn in filenames:
+                if fn.lower().endswith(".xlsx"):
+                    files.append(os.path.join(root, fn))
+        return files
+    except Exception as e:
+        raise RuntimeError(f"Không thể tải folder Google Drive: {e}")
+
+
+def download_gdrive_file(file_id: str, dest_path: str):
+    """Download a single file from Google Drive by ID."""
+    try:
+        import gdown
+        url = f"https://drive.google.com/uc?id={file_id}"
+        gdown.download(url, dest_path, quiet=True)
+    except Exception as e:
+        raise RuntimeError(f"Không thể tải file Google Drive: {e}")
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Source file parsing
+# ─────────────────────────────────────────────────────────────────────────────
+
+# Regex to extract Tổng/Nam/Nữ from free-text sentences:
+_TEXT_TOTAL_RE = re.compile(
+    r'là[:\s]*(\d+)\s*người[^\n]*?[:\s]+(\d+)\s*[Nn]am[;,\s]+(\d+)\s*[Nn]ữ',
+    re.IGNORECASE | re.UNICODE
+)
+_TEXT_ALT_RE = re.compile(
+    r'(\d+)\s*người[^\n]*?(\d+)\s*[Nn]am[;,\s]+(\d+)\s*[Nn]ữ',
+    re.IGNORECASE | re.UNICODE
+)
+# Regex to find cell references inside a formula like =...&B584&...&C584&...&D584&...
+# Captures up to 4 cell refs that are likely to hold the numbers
+_FORMULA_REF_RE = re.compile(r'&([A-Z]+\d+)&', re.IGNORECASE)
+
+
+# ── Sheet priority groups (normalized names) ─────────────────────────────────
+# Priority 1: Explicit 'Tổng hợp' summary sheets
+_SUMMARY_SHEET_NAMES = {
+    "tong hop cu tri", "tong hop", "tonghop", "tonghopcu tri"
+}
+# Priority 2: Total/aggregate sheets (may contain T/N/N in table or text)
+_TOTAL_SHEET_NAMES = {
+    "tong",          # Tổng
+    "sheet tong",    # SHEET TỔNG (Khu phố Minh Khai)
+}
+
+
+def _norm(name: str) -> str:
+    """Normalize a sheet name for comparison."""
+    return normalize_text(name)
+
+
+def get_candidate_sheets(wb: openpyxl.Workbook) -> list:
+    """
+    Return ALL worksheets in priority order to search for Tổng/Nam/Nữ data:
+    1. Explicit summary sheets ('Tổng hợp cử tri', 'Tổng hợp', ...)
+    2. Total/aggregate sheets ('Tổng', 'SHEET TỔNG', 'TH', 'biểu', 'Khu Phố', ...)
+    3. All other sheets (to handle any remaining edge cases)
+
+    Each group keeps the workbook's original sheet order.
+    """
+    group1, group2, group3 = [], [], []
+    for name in wb.sheetnames:
+        n = _norm(name)
+        # Check group 1: 'tong hop' substring (handles slight variations)
+        if n in _SUMMARY_SHEET_NAMES or "tong hop" in n:
+            group1.append(wb[name])
+        # Check group 2: exact match against known total sheet names
+        elif n in _TOTAL_SHEET_NAMES:
+            group2.append(wb[name])
+        else:
+            group3.append(wb[name])
+    return group1 + group2 + group3
+
+
+def extract_from_text_cell(cell_value) -> dict | None:
+    """
+    Try to extract (tong, nam, nu) from a free-text string cell.
+    Handles patterns like:
+      'Tổng số cử tri của khu vực bỏ phiếu là:1266 người; trong đó có: 607 Nam; 659 Nữ.'
+      'Tổng số cử tri ... là 1150 người; trong đó có: 554 Nam, 596 Nữ.'
+    """
+    if not isinstance(cell_value, str):
+        return None
+    text = cell_value.strip()
+    if not text:
+        return None
+
+    # Try primary pattern
+    m = _TEXT_TOTAL_RE.search(text)
+    if m:
+        tong, nam, nu = int(m.group(1)), int(m.group(2)), int(m.group(3))
+        if tong > 0 and (nam + nu == tong or nam > 0 and nu > 0):
+            return {"tong": tong, "nam": nam, "nu": nu}
+
+    # Try alt pattern
+    m = _TEXT_ALT_RE.search(text)
+    if m:
+        tong, nam, nu = int(m.group(1)), int(m.group(2)), int(m.group(3))
+        if tong > 0 and nam > 0 and nu > 0:
+            return {"tong": tong, "nam": nam, "nu": nu}
+
+    return None
+
+
+def find_total_row(ws, wb_formulas=None) -> dict | None:
+    """
+    Scan worksheet for Tổng/Nam/Nữ data using multiple strategies:
+
+    Strategy 0 (FORMULA): When wb_formulas provided, scan formula cells that
+      return None in data_only mode. Parse &CellRef& patterns from the formula
+      string and read those numeric cells directly.
+
+    Strategy 1 (TEXT): Scan cell values for free-text sentence pattern.
+
+    Strategy 2 (STRUCTURED): 'Tổng' label row with tong == nam + nu.
+
+    Strategy 3 (SMART TRIPLET): Any 3 numbers in close proximity (same row or
+      adjacent rows) where tong = nam + nu and tong > 50.
+
+    Strategy 4 (FALLBACK): 'Tổng' label row with any 3 positive nums.
+    """
+    all_rows = list(ws.iter_rows(values_only=True))
+
+    # ── Strategy 0: Parse formula cells via wb_formulas ──────────────────────
+    if wb_formulas and ws.title in wb_formulas.sheetnames:
+        ws_f = wb_formulas[ws.title]
+        for row_f in ws_f.iter_rows():
+            for cell_f in row_f:
+                val = cell_f.value
+                # Only care about formula cells that look like text concatenations
+                if not isinstance(val, str) or not val.startswith('='):
+                    continue
+                # Check if the formula text contains tong/nam/nu keywords
+                norm_formula = normalize_text(val)
+                if 'nguoi' not in norm_formula and 'ng' not in norm_formula:
+                    continue
+                # Extract cell references like &B17& &C17& &D17&
+                refs = _FORMULA_REF_RE.findall(val)
+                nums_from_refs = []
+                for ref in refs:
+                    try:
+                        ref_cell = ws_f[ref]  # same sheet
+                        ref_val = extract_numeric(ref_cell.value)
+                        if ref_val is not None:
+                            nums_from_refs.append(ref_val)
+                    except Exception:
+                        pass
+                if len(nums_from_refs) >= 3:
+                    tong, nam, nu = nums_from_refs[0], nums_from_refs[1], nums_from_refs[2]
+                    if tong == nam + nu and tong > 0:
+                        return {"tong": tong, "nam": nam, "nu": nu}
+                    # Try all triples
+                    for i in range(len(nums_from_refs) - 2):
+                        t, m, f = nums_from_refs[i], nums_from_refs[i+1], nums_from_refs[i+2]
+                        if t == m + f and t > 0:
+                            return {"tong": t, "nam": m, "nu": f}
+
+    # ── Strategy 1: Text sentence extraction ─────────────────────────────
+    for row in all_rows:
+        for cell in row:
+            result = extract_from_text_cell(cell)
+            if result:
+                return result
+
+    # ── Strategy 2: Structured table row with Tổng label ───────────────────
+    best_candidate = None
+
+    for row in all_rows:
+        label_found = any(is_total_row_label(cell) for cell in row)
+        if not label_found:
+            continue
+
+        nums = [extract_numeric(c) for c in row if extract_numeric(c) is not None]
+
+        if len(nums) >= 3:
+            tong, nam, nu = nums[0], nums[1], nums[2]
+            if tong == nam + nu:
+                return {"tong": tong, "nam": nam, "nu": nu}
+            for i in range(len(nums) - 2):
+                t, m, f = nums[i], nums[i+1], nums[i+2]
+                if t == m + f and t > 0:
+                    return {"tong": t, "nam": m, "nu": f}
+            if tong > 0 and nam > 0 and nu > 0:
+                if best_candidate is None or tong > best_candidate["tong"]:
+                    best_candidate = {"tong": tong, "nam": nam, "nu": nu}
+
+        elif len(nums) == 1:
+            row_idx = all_rows.index(row)
+            if row_idx + 1 < len(all_rows):
+                next_nums = [extract_numeric(c) for c in all_rows[row_idx + 1]
+                             if extract_numeric(c) is not None]
+                if len(next_nums) >= 2:
+                    return {"tong": nums[0], "nam": next_nums[0], "nu": next_nums[1]}
+
+    if best_candidate:
+        return best_candidate
+
+    # ── Strategy 3: Smart triplet scan (tong = nam + nu, tong > 50) ─────────
+    # Scan the LAST 100 rows for any row with exactly 2-4 numbers where t=m+f
+    for row in reversed(all_rows[-200:] if len(all_rows) > 200 else all_rows):
+        nums = [extract_numeric(c) for c in row if extract_numeric(c) is not None]
+        if len(nums) < 2:
+            continue
+        for i in range(len(nums) - 1):
+            m_val, f_val = nums[i], nums[i+1]
+            if m_val > 0 and f_val > 0:
+                t_val = m_val + f_val
+                if t_val > 50:  # Reasonable voter count threshold
+                    # Check if t_val appears in nearby rows too
+                    # Look backwards for t_val
+                    idx = all_rows.index(row) if row in all_rows else -1
+                    if idx > 0:
+                        prev_row_nums = [extract_numeric(c) for c in all_rows[idx-1]
+                                         if extract_numeric(c) is not None]
+                        if t_val in prev_row_nums:
+                            return {"tong": t_val, "nam": m_val, "nu": f_val}
+
+    # ── Strategy 4: Ultimate fallback ─────────────────────────────────
+    for row in reversed(all_rows):
+        nums = [extract_numeric(c) for c in row if extract_numeric(c) is not None]
+        if len(nums) >= 3 and any(is_total_row_label(c) for c in row):
+            return {"tong": nums[0], "nam": nums[1], "nu": nums[2]}
+
+    return None
+
+
+def count_age_groups(wb: openpyxl.Workbook, sheetname_hint=None):
+    """
+    Scan the workbook for a sheet containing voter DOB data.
+    Returns (count_18, count_elderly).
+    - count_18:      born in [DOB_18_START, DOB_18_END]
+    - count_elderly: born on or before DOB_ELDERLY
+    """
+    # Determine which sheet to scan
+    ws = None
+    if sheetname_hint and sheetname_hint in wb.sheetnames:
+        ws = wb[sheetname_hint]
+    else:
+        # Try to find a sheet with voter list (not summary sheet)
+        for name in wb.sheetnames:
+            lower = normalize_text(name)
+            # Skip summary sheets
+            if "tong hop" in lower or "tổng hợp" in lower:
+                continue
+            ws = wb[name]
+            break
+        if ws is None:
+            ws = wb.worksheets[0]
+
+    count_18 = 0
+    count_elderly = 0
+
+    for row in ws.iter_rows(values_only=True):
+        for cell in row:
+            dob = None
+            if isinstance(cell, datetime.datetime):
+                dob = cell.date()
+            elif isinstance(cell, datetime.date):
+                dob = cell
+            elif isinstance(cell, str):
+                # Try parsing common Vietnamese date formats
+                for fmt in ("%d/%m/%Y", "%d-%m-%Y", "%Y-%m-%d", "%d/%m/%y"):
+                    try:
+                        dob = datetime.datetime.strptime(cell.strip(), fmt).date()
+                        break
+                    except ValueError:
+                        continue
+
+            if dob is None:
+                continue
+
+            if DOB_18_START <= dob <= DOB_18_END:
+                count_18 += 1
+            if dob <= DOB_ELDERLY:
+                count_elderly += 1
+
+    return count_18, count_elderly
+
+
+def process_source_file(filepath: str) -> dict:
+    """
+    Read a source .xlsx file and return extracted data.
+    Uses data_only=True for values + also loads without data_only for formula fallback.
+    Tries ALL candidate sheets in priority order until Tổng/Nam/Nữ is found.
+    """
+    result = {"tong": None, "nam": None, "nu": None,
+              "ct18": None, "elderly": None, "error": None}
+    try:
+        wb = load_workbook(filepath, data_only=True)
+    except Exception as e:
+        result["error"] = f"Không mở được file: {e}"
+        return result
+
+    # Load formula version as fallback (for cells where data_only returns None)
+    try:
+        wb_formulas = load_workbook(filepath, data_only=False)
+    except Exception:
+        wb_formulas = None
+
+    # --- Find Tổng / Nam / Nữ: try each candidate sheet in priority order ---
+    candidates = get_candidate_sheets(wb)
+    totals = None
+    tried_sheets = []
+    for ws in candidates:
+        tried_sheets.append(ws.title)
+        totals = find_total_row(ws, wb_formulas=wb_formulas)
+        if totals:
+            break
+
+    if totals is None:
+        result["error"] = (
+            f"Không tìm được Tổng/Nam/Nữ trong các sheet: {tried_sheets}"
+        )
+    else:
+        result["tong"] = totals["tong"]
+        result["nam"]  = totals["nam"]
+        result["nu"]   = totals["nu"]
+
+    # --- Count age groups (scan all sheets with DOB data) ---
+    try:
+        ct18, elderly = count_age_groups(wb)
+        result["ct18"]    = ct18
+        result["elderly"] = elderly
+    except Exception:
+        result["elderly"] = None
+        result["ct18"]    = None
+
+    return result
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Summary file update
+# ─────────────────────────────────────────────────────────────────────────────
+
+def col_letter_to_idx(letter: str) -> int:
+    """Convert column letter like 'A' → 1, 'F' → 6."""
+    result = 0
+    for c in letter.upper():
+        result = result * 26 + (ord(c) - ord('A') + 1)
+    return result
+
+
+def find_name_column(ws) -> int | None:
+    """
+    Scan rows to find the column that contains khu phố names.
+    Returns 1-based column index or None.
+    """
+    for row in ws.iter_rows(min_row=1, max_row=30, values_only=True):
+        for col_idx, cell in enumerate(row, start=1):
+            if cell and isinstance(cell, str) and len(cell.strip()) > 3:
+                norm = normalize_text(cell)
+                # Heuristic: column contains something like "Khu phố 1", "Thôn", etc.
+                if any(k in norm for k in ["khu pho", "thon", "ban ", "xa ", "phuong"]):
+                    return col_idx
+    return None
+
+
+def update_summary_file(summary_path: str, data_map: dict, log_fn=None) -> bytes:
+    """
+    Update summary xlsx with aggregated data.
+
+    data_map: {normalized_name: {'tong':..,'nam':..,'nu':..,'ct18':..,'elderly':..}}
+
+    Returns the updated workbook as bytes.
+    """
+    wb = load_workbook(summary_path)
+    ws = wb.active
+
+    # Column indices (1-based) for F, G, H, K, L
+    COL_F = 6   # Tổng số
+    COL_G = 7   # Nam
+    COL_H = 8   # Nữ
+    COL_K = 11  # Cử tri 18 tuổi
+    COL_L = 12  # Cử tri cao tuổi
+
+    # Try to auto-detect name column (fallback is col A=1 or B=2)
+    name_col = find_name_column(ws)
+    if name_col is None:
+        # Try columns A and B by looking for match
+        name_col = 1  # default
+
+    updated_rows = 0
+    for row in ws.iter_rows():
+        name_cell = row[name_col - 1]  # 0-indexed
+        if not name_cell.value:
+            continue
+        row_name_norm = normalize_text(str(name_cell.value))
+
+        # Try to find matching entry in data_map
+        matched_key = None
+        for key in data_map:
+            if key in row_name_norm or row_name_norm in key:
+                matched_key = key
+                break
+            # Fuzzy: check if key is substring or vice versa
+            if normalize_text(key) == row_name_norm:
+                matched_key = key
+                break
+
+        if matched_key is None:
+            continue
+
+        data = data_map[matched_key]
+        row_idx = name_cell.row
+
+        # Write values
+        if data.get("tong") is not None:
+            ws.cell(row=row_idx, column=COL_F).value = data["tong"]
+        if data.get("nam") is not None:
+            ws.cell(row=row_idx, column=COL_G).value = data["nam"]
+        if data.get("nu") is not None:
+            ws.cell(row=row_idx, column=COL_H).value = data["nu"]
+        if data.get("ct18") is not None:
+            ws.cell(row=row_idx, column=COL_K).value = data["ct18"]
+        if data.get("elderly") is not None:
+            ws.cell(row=row_idx, column=COL_L).value = data["elderly"]
+
+        updated_rows += 1
+        if log_fn:
+            log_fn(f"  ✅ Cập nhật hàng '{name_cell.value}': "
+                   f"Tổng={data.get('tong')}, Nam={data.get('nam')}, Nữ={data.get('nu')}, "
+                   f"CT18={data.get('ct18')}, Cao tuổi={data.get('elderly')}")
+
+    if log_fn:
+        log_fn(f"\n📊 Tổng số hàng đã cập nhật: **{updated_rows}**")
+
+    # Save to buffer
+    buf = io.BytesIO()
+    wb.save(buf)
+    buf.seek(0)
+    return buf.read()
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Source file collection (local or GDrive)
+# ─────────────────────────────────────────────────────────────────────────────
+
+def collect_source_files(source_input: str, tmp_dir: str) -> list:
+    """
+    Returns list of (display_name, filepath) tuples.
+    Handles:
+      - local folder path
+      - Google Drive folder URL
+    De-duplicates by filename (keep random one).
+    """
+    files_raw = []
+
+    if "drive.google.com" in source_input or "docs.google.com" in source_input:
+        folder_id = parse_gdrive_folder_id(source_input)
+        if not folder_id:
+            raise ValueError("Không nhận ra folder ID từ link Google Drive.")
+        dl_dir = os.path.join(tmp_dir, "gdrive_src")
+        os.makedirs(dl_dir, exist_ok=True)
+        files_raw = download_gdrive_folder(folder_id, dl_dir)
+    else:
+        # Local path
+        path = source_input.strip().strip('"').strip("'")
+        if not os.path.isdir(path):
+            raise ValueError(f"Không tìm thấy folder: {path}")
+        for fn in os.listdir(path):
+            if fn.lower().endswith(".xlsx") and not fn.startswith("~"):
+                files_raw.append(os.path.join(path, fn))
+
+    # De-duplicate by filename stem
+    name_map: dict[str, list] = {}
+    for fp in files_raw:
+        stem = os.path.splitext(os.path.basename(fp))[0]
+        name_map.setdefault(stem, []).append(fp)
+
+    result = []
+    for stem, paths in name_map.items():
+        chosen = random.choice(paths)
+        result.append((stem, chosen))
+
+    return sorted(result, key=lambda x: x[0])
+
+
+def get_summary_file_bytes(summary_input: str, tmp_dir: str) -> str:
+    """Download or resolve the summary file. Returns local filepath."""
+    if "drive.google.com" in summary_input or "docs.google.com" in summary_input:
+        file_id = parse_gdrive_file_id(summary_input)
+        if not file_id:
+            raise ValueError("Không nhận ra file ID từ link Google Drive.")
+        dest = os.path.join(tmp_dir, "summary_file.xlsx")
+        download_gdrive_file(file_id, dest)
+        return dest
+    else:
+        path = summary_input.strip().strip('"').strip("'")
+        if not os.path.isfile(path):
+            raise ValueError(f"Không tìm thấy file: {path}")
+        return path
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Streamlit UI
+# ─────────────────────────────────────────────────────────────────────────────
+
+def main():
+    st.set_page_config(
+        page_title="Tổng hợp Dữ liệu Cử tri",
+        page_icon="🗳️",
+        layout="wide",
+        initial_sidebar_state="expanded",
+    )
+
+    # ── Custom CSS ──────────────────────────────────────────────────────────
+    st.markdown("""
+    <style>
+    @import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap');
+
+    html, body, [class*="css"] {
+        font-family: 'Inter', sans-serif;
+    }
+
+    .main-header {
+        background: linear-gradient(135deg, #1a237e 0%, #283593 50%, #3949ab 100%);
+        padding: 2rem 2.5rem;
+        border-radius: 16px;
+        margin-bottom: 2rem;
+        box-shadow: 0 4px 24px rgba(26,35,126,0.2);
+    }
+    .main-header h1 {
+        color: white;
+        font-size: 2rem;
+        font-weight: 700;
+        margin: 0;
+        letter-spacing: -0.5px;
+    }
+    .main-header p {
+        color: rgba(255,255,255,0.8);
+        margin: 0.4rem 0 0 0;
+        font-size: 1rem;
+    }
+
+    .info-card {
+        background: linear-gradient(135deg, #e3f2fd, #bbdefb);
+        border-left: 4px solid #1976d2;
+        border-radius: 10px;
+        padding: 1rem 1.25rem;
+        margin-bottom: 1rem;
+    }
+    .info-card h4 { color: #0d47a1; margin: 0 0 0.4rem 0; }
+    .info-card p  { color: #1565c0; margin: 0; font-size: 0.88rem; }
+
+    .log-box {
+        background: #0d1117;
+        color: #c9d1d9;
+        border-radius: 10px;
+        padding: 1.25rem;
+        font-family: 'Courier New', monospace;
+        font-size: 0.85rem;
+        line-height: 1.7;
+        max-height: 400px;
+        overflow-y: auto;
+        border: 1px solid #30363d;
+    }
+
+    .metric-card {
+        background: white;
+        border-radius: 12px;
+        padding: 1.25rem;
+        text-align: center;
+        box-shadow: 0 2px 12px rgba(0,0,0,0.08);
+        border: 1px solid #e0e0e0;
+    }
+    .metric-card .value {
+        font-size: 2.2rem;
+        font-weight: 700;
+        color: #1a237e;
+    }
+    .metric-card .label {
+        color: #666;
+        font-size: 0.85rem;
+        margin-top: 0.2rem;
+    }
+
+    div[data-testid="stButton"] > button {
+        background: linear-gradient(135deg, #1a237e, #3949ab);
+        color: white;
+        border: none;
+        border-radius: 10px;
+        padding: 0.65rem 2rem;
+        font-weight: 600;
+        font-size: 1rem;
+        width: 100%;
+        transition: all 0.2s ease;
+        box-shadow: 0 4px 14px rgba(57,73,171,0.35);
+    }
+    div[data-testid="stButton"] > button:hover {
+        transform: translateY(-2px);
+        box-shadow: 0 6px 20px rgba(57,73,171,0.5);
+    }
+
+    .stDownloadButton > button {
+        background: linear-gradient(135deg, #2e7d32, #43a047) !important;
+        color: white !important;
+        border: none !important;
+        border-radius: 10px !important;
+        width: 100% !important;
+        font-weight: 600 !important;
+    }
+
+    section[data-testid="stSidebar"] {
+        background: linear-gradient(180deg, #f8f9ff 0%, #eff1ff 100%);
+    }
+    </style>
+    """, unsafe_allow_html=True)
+
+    # ── Header ──────────────────────────────────────────────────────────────
+    st.markdown("""
+    <div class="main-header">
+        <h1>🗳️ Tổng hợp Dữ liệu Cử tri</h1>
+        <p>Tự động đọc file Excel nguồn từ nhiều khu phố/thôn và cập nhật vào bảng tổng hợp</p>
+    </div>
+    """, unsafe_allow_html=True)
+
+    # ── Sidebar inputs ───────────────────────────────────────────────────────
+    with st.sidebar:
+        st.markdown("## ⚙️ Cấu hình")
+        st.markdown("---")
+
+        # ── Input mode toggle
+        input_mode = st.radio(
+            "📥 Chế độ nhập liệu",
+            ["Upload file lên trực tiếp ▲", "Nhập đường dẫn / Google Drive"],
+            help="Chọn cách cung cấp dữ liệu"
+        )
+        st.markdown("---")
+
+        uploaded_sources = None
+        uploaded_summary = None
+        source_input = ""
+        summary_input = ""
+
+        if input_mode == "Upload file lên trực tiếp ▲":
+            st.markdown("### 📁 Nguồn dữ liệu")
+            uploaded_sources = st.file_uploader(
+                "Chọn nhiều file .xlsx nguồn (mỗi file = 1 khu phố)",
+                type=["xlsx"],
+                accept_multiple_files=True,
+                help="Chọn tất cả file .xlsx của các khu phố cùng lúc"
+            )
+            if uploaded_sources:
+                st.success(f"✅ Đã chọn {len(uploaded_sources)} file")
+
+            st.markdown("### 📊 File tổng hợp")
+            uploaded_summary = st.file_uploader(
+                "Chọn file BIỂU TỔNG HỢP.xlsx",
+                type=["xlsx"],
+                accept_multiple_files=False,
+                key="summary_uploader",
+                help="File này sẽ được cập nhật cột F, G, H, K, L"
+            )
+            if uploaded_summary:
+                st.success(f"✅ Đã chọn: {uploaded_summary.name}")
+
+        else:
+            st.markdown("### 📁 Nguồn dữ liệu")
+            source_input = st.text_area(
+                "Folder chứa file .xlsx nguồn",
+                placeholder=(
+                    "Đường dẫn local:\n  /Users/ten/Documents/du_lieu\n\n"
+                    "Google Drive:\n  https://drive.google.com/drive/folders/..."
+                ),
+                height=100,
+                help="Mỗi file .xlsx = một khu phố",
+            )
+            st.markdown("### 📊 File tổng hợp")
+            summary_input = st.text_area(
+                "File BIỂU TỔNG HỢP.xlsx",
+                placeholder=(
+                    "Đường dẫn local:\n  /Users/ten/Documents/BIEU_TONG_HOP.xlsx\n\n"
+                    "Google Drive:\n  https://drive.google.com/file/d/..."
+                ),
+                height=100,
+                help="File này sẽ được cập nhật cột F, G, H, K, L"
+            )
+
+        st.markdown("---")
+
+        with st.expander("📋 Cột sẽ được cập nhật"):
+            st.markdown("""
+            | Cột | Nội dung |
+            |-----|----------|
+            | **F** | Tổng số cử tri |
+            | **G** | Nam |
+            | **H** | Nữ |
+            | **K** | Cử tri 18 tuổi lần đầu |
+            | **L** | Cử tri cao tuổi (>80 tuổi) |
+            """)
+
+        with st.expander("ℹ️ Ghi chú"):
+            st.markdown("""
+            - **Ngày bầu cử:** 15/3/2026  
+            - **CT 18 tuổi:** sinh từ 16/3/2007 → 15/3/2008  
+            - **Cao tuổi >80:** sinh trước/bằng 15/3/1946  
+            - File trùng tên → chọn ngẫu nhiên 1 file  
+            - Google Drive folder phải **public** (Anyone with the link)
+            """)
+
+        st.markdown("---")
+        process_btn = st.button("▶ Bắt đầu xử lý", use_container_width=True)
+
+    # ── Main area ────────────────────────────────────────────────────────────
+    if not process_btn:
+        col1, col2 = st.columns(2)
+        with col1:
+            st.markdown("""
+            <div class="info-card">
+                <h4>📁 Bước 1 — Nhập đường dẫn folder nguồn</h4>
+                <p>Folder chứa nhiều file .xlsx, mỗi file là một khu phố/thôn/bản.
+                Hỗ trợ đường dẫn local và link Google Drive folder (public).</p>
+            </div>
+            """, unsafe_allow_html=True)
+        with col2:
+            st.markdown("""
+            <div class="info-card">
+                <h4>📊 Bước 2 — Nhập đường dẫn file tổng hợp</h4>
+                <p>File BIỂU TỔNG HỢP DANH SÁCH CỬ TRI.xlsx sẽ được đọc và
+                cập nhật tự động. File gốc không bị thay đổi — bạn tải bản mới về.</p>
+            </div>
+            """, unsafe_allow_html=True)
+
+        st.markdown("""
+        <div class="info-card">
+            <h4>🔄 Bước 3 — Bấm "Bắt đầu xử lý"</h4>
+            <p>Hệ thống sẽ tự động đọc từng file nguồn, trích xuất Tổng/Nam/Nữ
+            và đếm cử tri theo nhóm tuổi, sau đó cập nhật vào bảng tổng hợp.
+            Preview kết quả và tải file .xlsx mới về máy.</p>
+        </div>
+        """, unsafe_allow_html=True)
+        return
+
+    # ── Processing ────────────────────────────────────────────────────────────
+    is_upload_mode = (input_mode == "Upload file lên trực tiếp ▲")
+
+    if is_upload_mode:
+        if not uploaded_sources:
+            st.error("⚠️ Vui lòng upload ít nhất 1 file .xlsx nguồn.")
+            return
+        if uploaded_summary is None:
+            st.error("⚠️ Vui lòng upload file BIỂU TỔNG HỢP.xlsx.")
+            return
+    else:
+        if not source_input.strip():
+            st.error("⚠️ Vui lòng nhập đường dẫn folder nguồn.")
+            return
+        if not summary_input.strip():
+            st.error("⚠️ Vui lòng nhập đường dẫn file tổng hợp.")
+            return
+
+    log_lines: list[str] = []
+    progress_placeholder = st.empty()
+    log_placeholder = st.empty()
+
+    def log(msg: str):
+        log_lines.append(msg)
+        display = "\n".join(log_lines)
+        log_placeholder.markdown(
+            f'<div class="log-box"><pre style="margin:0;white-space:pre-wrap;">{display}</pre></div>',
+            unsafe_allow_html=True
+        )
+
+    with tempfile.TemporaryDirectory() as tmp_dir:
+        log("🚀 Bắt đầu xử lý...\n")
+
+        # Step 1: collect source files
+        if is_upload_mode:
+            # Save uploaded files to temp dir
+            source_files = []
+            for f in uploaded_sources:
+                stem = os.path.splitext(f.name)[0]
+                dst = os.path.join(tmp_dir, f.name)
+                with open(dst, 'wb') as out:
+                    out.write(f.read())
+                source_files.append((stem, dst))
+            source_files = sorted(source_files, key=lambda x: x[0])
+            log(f"   → Đã nhận {len(source_files)} file .xlsx từ upload\n")
+        else:
+            try:
+                log("📂 Đang đọc folder nguồn...")
+                source_files = collect_source_files(source_input, tmp_dir)
+                log(f"   → Tìm thấy {len(source_files)} file .xlsx\n")
+            except Exception as e:
+                st.error(f"❌ Lỗi đọc folder nguồn: {e}")
+                log(f"❌ Lỗi: {e}")
+                return
+
+        if not source_files:
+            st.warning("⚠️ Không tìm thấy file .xlsx nào trong folder nguồn.")
+            return
+
+        # Step 2: load summary file
+        if is_upload_mode:
+            summary_path = os.path.join(tmp_dir, uploaded_summary.name)
+            with open(summary_path, 'wb') as out:
+                out.write(uploaded_summary.read())
+            log("   → Đã nhận file tổng hợp từ upload\n")
+        else:
+            try:
+                log("📊 Đang tải file tổng hợp...")
+                summary_path = get_summary_file_bytes(summary_input, tmp_dir)
+                log("   → Tải thành công\n")
+            except Exception as e:
+                st.error(f"❌ Lỗi đọc file tổng hợp: {e}")
+                log(f"❌ Lỗi: {e}")
+                return
+
+        # Step 3: process each source file
+        data_map: dict = {}
+        errors: list = []
+
+        progress_bar = progress_placeholder.progress(0, text="Đang xử lý file nguồn...")
+        n = len(source_files)
+
+        for i, (stem, filepath) in enumerate(source_files):
+            log(f"📄 [{i+1}/{n}] Đang xử lý: {stem} ...")
+            result = process_source_file(filepath)
+
+            if result["error"]:
+                errors.append((stem, result["error"]))
+                log(f"   ⚠️  Lỗi: {result['error']}")
+            else:
+                key = normalize_text(stem)
+                data_map[key] = result
+                log(f"   ✅ Tổng={result['tong']}, Nam={result['nam']}, "
+                    f"Nữ={result['nu']}, CT18={result['ct18']}, "
+                    f"Cao tuổi={result['elderly']}")
+
+            progress_bar.progress((i + 1) / n, text=f"Đang xử lý [{i+1}/{n}]: {stem}")
+
+        progress_bar.progress(1.0, text="Hoàn thành đọc file nguồn ✓")
+
+        # Step 4: update summary file
+        log("\n📝 Đang ghi vào file tổng hợp...")
+        try:
+            updated_bytes = update_summary_file(summary_path, data_map, log_fn=log)
+        except Exception as e:
+            st.error(f"❌ Lỗi cập nhật file tổng hợp: {e}")
+            log(f"❌ Lỗi: {e}")
+            return
+
+        log("\n✅ Hoàn thành! File sẵn sàng để tải về.")
+
+        # ── Summary metrics ──────────────────────────────────────────────────
+        st.markdown("<br>", unsafe_allow_html=True)
+        col1, col2, col3 = st.columns(3)
+        with col1:
+            st.markdown(f"""
+            <div class="metric-card">
+                <div class="value">{len(source_files)}</div>
+                <div class="label">File nguồn đã đọc</div>
+            </div>""", unsafe_allow_html=True)
+        with col2:
+            st.markdown(f"""
+            <div class="metric-card">
+                <div class="value">{len(data_map)}</div>
+                <div class="label">Khu phố cập nhật thành công</div>
+            </div>""", unsafe_allow_html=True)
+        with col3:
+            st.markdown(f"""
+            <div class="metric-card">
+                <div class="value">{len(errors)}</div>
+                <div class="label">File lỗi (không xử lý được)</div>
+            </div>""", unsafe_allow_html=True)
+
+        # ── Error details ────────────────────────────────────────────────────
+        if errors:
+            st.markdown("<br>", unsafe_allow_html=True)
+            with st.expander(f"⚠️ {len(errors)} file gặp lỗi (click để xem chi tiết)"):
+                for fname, err in errors:
+                    st.error(f"**{fname}**: {err}")
+
+        # ── Preview updated summary ──────────────────────────────────────────
+        st.markdown("---")
+        st.markdown("### 📋 Preview bảng tổng hợp sau khi cập nhật")
+
+        try:
+            preview_df = pd.read_excel(
+                io.BytesIO(updated_bytes),
+                header=None,
+            )
+            # Show first 50 rows, limited columns
+            st.dataframe(
+                preview_df.head(50),
+                use_container_width=True,
+                hide_index=False,
+            )
+        except Exception as e:
+            st.warning(f"Không preview được bảng tổng hợp: {e}")
+
+        # ── Download button ──────────────────────────────────────────────────
+        st.markdown("<br>", unsafe_allow_html=True)
+        st.download_button(
+            label="⬇️  Tải file tổng hợp đã cập nhật (.xlsx)",
+            data=updated_bytes,
+            file_name="BIEU_TONG_HOP_DA_CAP_NHAT.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            use_container_width=True,
+        )
+
+        st.success("🎉 Xử lý hoàn tất! Bấm nút trên để tải file về máy.")
+
+
+if __name__ == "__main__":
+    main()
