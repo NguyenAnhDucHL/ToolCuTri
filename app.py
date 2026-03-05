@@ -127,10 +127,15 @@ def download_gdrive_file(file_id: str, dest_path: str):
 # Regex to extract Tổng/Nam/Nữ from free-text sentences:
 _TEXT_TOTAL_RE = re.compile(
     r'là[:\s]*(\d+)\s*người[^\n]*?[:\s]+(\d+)\s*[Nn]am[;,\s]+(\d+)\s*[Nn]ữ',
-    re.IGNORECASE | re.UNICODE
+    re.IGNORECASE | re.UNICODE,
 )
 _TEXT_ALT_RE = re.compile(
     r'(\d+)\s*người[^\n]*?(\d+)\s*[Nn]am[;,\s]+(\d+)\s*[Nn]ữ',
+    re.IGNORECASE | re.UNICODE
+)
+# Alt pattern for "Nam: X; Nữ: Y" format
+_TEXT_NAM_NU_RE = re.compile(
+    r'(\d+)\s*người(?:[,;\s]|trong đó)+[Nn]am[:\s]*(\d+)[;,\s]+[Nn]ữ[:\s]*(\d+)',
     re.IGNORECASE | re.UNICODE
 )
 # Regex to find cell references inside a formula like =...&B584&...&C584&...&D584&...
@@ -198,8 +203,15 @@ def extract_from_text_cell(cell_value) -> dict | None:
         if tong > 0 and (nam + nu == tong or nam > 0 and nu > 0):
             return {"tong": tong, "nam": nam, "nu": nu}
 
-    # Try alt pattern
+    # Try alt pattern 1: X Nam, Y Nữ
     m = _TEXT_ALT_RE.search(text)
+    if m:
+        tong, nam, nu = int(m.group(1)), int(m.group(2)), int(m.group(3))
+        if tong > 0 and nam > 0 and nu > 0:
+            return {"tong": tong, "nam": nam, "nu": nu}
+
+    # Try alt pattern 2: Nam: X, Nữ: Y
+    m = _TEXT_NAM_NU_RE.search(text)
     if m:
         tong, nam, nu = int(m.group(1)), int(m.group(2)), int(m.group(3))
         if tong > 0 and nam > 0 and nu > 0:
@@ -330,57 +342,113 @@ def find_total_row(ws, wb_formulas=None) -> dict | None:
     return None
 
 
-def count_age_groups(wb: openpyxl.Workbook, sheetname_hint=None):
-    """
-    Scan the workbook for a sheet containing voter DOB data.
-    Returns (count_18, count_elderly).
-    - count_18:      born in [DOB_18_START, DOB_18_END]
-    - count_elderly: born on or before DOB_ELDERLY
-    """
-    # Determine which sheet to scan
-    ws = None
-    if sheetname_hint and sheetname_hint in wb.sheetnames:
-        ws = wb[sheetname_hint]
-    else:
-        # Try to find a sheet with voter list (not summary sheet)
-        for name in wb.sheetnames:
-            lower = normalize_text(name)
-            # Skip summary sheets
-            if "tong hop" in lower or "tổng hợp" in lower:
+_STOP_KEYWORDS = re.compile(
+    r"t[oô]ng\s*s[oô]\s*c[uư]\s*tri|c[uư]\s*tri\s*tham\s*gia|danh\s*s[aá]ch\s*[dđ][uư][oơ]c\s*l[aâ]p|ng[uư][oơ]i\s*l[aâ]p\s*bi[eê]u",
+    re.IGNORECASE | re.UNICODE,
+)
+
+def _parse_dob(cell_val) -> datetime.date | None:
+    """Parse a date-of-birth cell (datetime, date, or string) → date or None."""
+    if isinstance(cell_val, datetime.datetime):
+        return cell_val.date()
+    if isinstance(cell_val, datetime.date):
+        return cell_val
+    if isinstance(cell_val, str):
+        s = cell_val.strip()
+        for fmt in ("%d/%m/%Y", "%d-%m-%Y", "%Y-%m-%d", "%d/%m/%y", "%d.%m.%Y"):
+            try:
+                return datetime.datetime.strptime(s, fmt).date()
+            except ValueError:
                 continue
-            ws = wb[name]
-            break
-        if ws is None:
-            ws = wb.worksheets[0]
+    return None
 
-    count_18 = 0
-    count_elderly = 0
 
-    for row in ws.iter_rows(values_only=True):
-        for cell in row:
-            dob = None
-            if isinstance(cell, datetime.datetime):
-                dob = cell.date()
-            elif isinstance(cell, datetime.date):
-                dob = cell
-            elif isinstance(cell, str):
-                # Try parsing common Vietnamese date formats
-                for fmt in ("%d/%m/%Y", "%d-%m-%Y", "%Y-%m-%d", "%d/%m/%y"):
-                    try:
-                        dob = datetime.datetime.strptime(cell.strip(), fmt).date()
-                        break
-                    except ValueError:
-                        continue
+def _has_x(val) -> bool:
+    """Return True if cell contains an 'x' mark."""
+    return str(val or "").strip().lower() == "x"
 
-            if dob is None:
-                continue
 
-            if DOB_18_START <= dob <= DOB_18_END:
-                count_18 += 1
-            if dob <= DOB_ELDERLY:
-                count_elderly += 1
+def count_voter_stats(wb: openpyxl.Workbook) -> dict:
+    """
+    Scan voter-list sheets and return aggregated statistics matching the JS logic.
 
-    return count_18, count_elderly
+    Source file column layout (1-based):
+      3  = Ngày sinh
+      4  = Nam (x mark)
+      5  = Nữ  (x mark)
+      11 = Bầu đại biểu Quốc hội       (x mark)
+      12 = Bầu đại biểu HĐND tỉnh      (x mark)
+      13 = Bầu đại biểu HĐND cấp xã    (x mark)
+
+    Date milestones (election 15/03/2026):
+      CT18:    DOB in [16/03/2007, 15/03/2008]
+      Cao tuổi: DOB < 16/03/1946  (tức sinh trước ngày này là trên 80 tuổi)
+    """
+    stats = dict(
+        ct18=0,
+        elderly=0,
+        qh_total=0,  qh_nam=0,  qh_nu=0,
+        tinh_total=0, tinh_nam=0, tinh_nu=0,
+        xa_total=0,  xa_nam=0,  xa_nu=0,
+    )
+
+    # Cutoff dates (matching JS constants)
+    DOB_18_FROM = datetime.date(2007, 3, 16)
+    DOB_18_TO   = datetime.date(2008, 3, 15)
+    DOB_80_CUT  = datetime.date(1946, 3, 16)   # born BEFORE this → > 80 years old
+
+    # Scan every sheet that is NOT a summary sheet
+    for sheetname in wb.sheetnames:
+        norm = normalize_text(sheetname)
+        if "tong hop" in norm:
+            continue   # skip summary sheets
+        ws = wb[sheetname]
+
+        # Find the first data row (row 19+ per JS, but scan to be safe)
+        data_start = None
+        for row in ws.iter_rows(min_row=1, max_row=30, values_only=True):
+            row_idx = list(ws.iter_rows(min_row=1, max_row=30, values_only=True)).index(row) + 1
+            # Detect a row that looks like voter data: col 3 has a date
+            if _parse_dob(row[2] if len(row) > 2 else None) is not None:
+                data_start = row_idx
+                break
+
+        if data_start is None:
+            data_start = 19   # JS default
+
+        for row in ws.iter_rows(min_row=data_start, values_only=True):
+            # Stop at totals/footer row
+            ho_ten = str(row[1] if len(row) > 1 else "").strip().lower()
+            if _STOP_KEYWORDS.search(ho_ten):
+                break
+
+            dob    = _parse_dob(row[2] if len(row) > 2 else None)
+            co_nam = _has_x(row[3] if len(row) > 3 else None)
+            co_nu  = _has_x(row[4] if len(row) > 4 else None)
+            co_qh  = _has_x(row[10] if len(row) > 10 else None)
+            co_tinh = _has_x(row[11] if len(row) > 11 else None)
+            co_xa  = _has_x(row[12] if len(row) > 12 else None)
+
+            if dob is not None:
+                if DOB_18_FROM <= dob <= DOB_18_TO:
+                    stats["ct18"] += 1
+                if dob < DOB_80_CUT:
+                    stats["elderly"] += 1
+
+            if co_qh:
+                stats["qh_total"] += 1
+                if co_nam: stats["qh_nam"] += 1
+                if co_nu:  stats["qh_nu"]  += 1
+            if co_tinh:
+                stats["tinh_total"] += 1
+                if co_nam: stats["tinh_nam"] += 1
+                if co_nu:  stats["tinh_nu"]  += 1
+            if co_xa:
+                stats["xa_total"] += 1
+                if co_nam: stats["xa_nam"] += 1
+                if co_nu:  stats["xa_nu"]  += 1
+
+    return stats
 
 
 def process_source_file(filepath: str) -> dict:
@@ -389,8 +457,14 @@ def process_source_file(filepath: str) -> dict:
     Uses data_only=True for values + also loads without data_only for formula fallback.
     Tries ALL candidate sheets in priority order until Tổng/Nam/Nữ is found.
     """
-    result = {"tong": None, "nam": None, "nu": None,
-              "ct18": None, "elderly": None, "error": None}
+    result = {
+        "tong": None, "nam": None, "nu": None,
+        "ct18": None, "elderly": None,
+        "qh_total": None, "qh_nam": None, "qh_nu": None,
+        "tinh_total": None, "tinh_nam": None, "tinh_nu": None,
+        "xa_total": None, "xa_nam": None, "xa_nu": None,
+        "error": None,
+    }
     try:
         wb = load_workbook(filepath, data_only=True)
     except Exception as e:
@@ -422,14 +496,12 @@ def process_source_file(filepath: str) -> dict:
         result["nam"]  = totals["nam"]
         result["nu"]   = totals["nu"]
 
-    # --- Count age groups (scan all sheets with DOB data) ---
+    # --- Count full voter stats (age groups + voting categories) ---
     try:
-        ct18, elderly = count_age_groups(wb)
-        result["ct18"]    = ct18
-        result["elderly"] = elderly
+        stats = count_voter_stats(wb)
+        result.update(stats)
     except Exception:
-        result["elderly"] = None
-        result["ct18"]    = None
+        pass   # non-fatal – leave as None
 
     return result
 
@@ -461,76 +533,166 @@ def find_name_column(ws) -> int | None:
     return None
 
 
+_RE_LEADING_NUM = re.compile(r'^\d+[\.\-\s]+')
+_RE_PAREN       = re.compile(r'\(.*?\)')    # strip (đã in), (đã nộp), ...
+
+def _strip_file_prefix(name: str) -> str:
+    """
+    Normalise a file-stem or row-cell name for matching:
+    1. Strip leading number: '26. Khu phố ...'  → 'Khu phố ...'
+    2. Strip parenthetical suffixes: '... (đã in)' → '...'
+    """
+    name = _RE_LEADING_NUM.sub('', name).strip()
+    name = _RE_PAREN.sub('', name).strip()
+    return name
+
+
+def _name_key(name: str) -> str:
+    """Full normalisation: strip prefix/suffix + remove diacritics + lowercase."""
+    return normalize_text(_strip_file_prefix(name))
+
+
+def _token_overlap(a: str, b: str) -> float:
+    """
+    Return the Jaccard-like token overlap between two normalised strings.
+    tokenises on whitespace; ignores single-char tokens.
+    Returns value in [0, 1].
+    """
+    ta = {t for t in a.split() if len(t) > 1}
+    tb = {t for t in b.split() if len(t) > 1}
+    if not ta or not tb:
+        return 0.0
+    return len(ta & tb) / max(len(ta), len(tb))
+
+
+def _fuzzy_match(norm_row: str, lookup: dict, threshold: float = 0.6):
+    """
+    Fuzzy fallback: find the lookup key with the highest token overlap
+    with norm_row, only if overlap >= threshold.
+    Returns the matched (orig_key, data) tuple or None.
+    """
+    best_score, best_entry = 0.0, None
+    for lk, val in lookup.items():
+        # Fast short-circuit: substring match
+        if lk and (lk in norm_row or norm_row in lk):
+            return val
+        score = _token_overlap(norm_row, lk)
+        if score > best_score:
+            best_score, best_entry = score, val
+    if best_score >= threshold:
+        return best_entry
+    return None
+
+
 def update_summary_file(summary_path: str, data_map: dict, log_fn=None) -> bytes:
     """
     Update summary xlsx with aggregated data.
 
-    data_map: {normalized_name: {'tong':..,'nam':..,'nu':..,'ct18':..,'elderly':..}}
+    data_map: {display_name: {'tong':..,'nam':..,'nu':..,'ct18':..,'elderly':..}}
+      - Keys are the original source file stems (e.g. '31. Khu phố Lê Lợi').
+
+    Column mapping (user-confirmed):
+      F (6)  = Tổng số cử tri
+      G (7)  = Nam
+      H (8)  = Nữ
+      K (11) = Cử tri 18 tuổi lần đầu bỏ phiếu
+      L (12) = Cử tri cao tuổi (> 80)
+
+    Name matching: column B (col 2) holds the unit names to match against.
+    Both the row value and the file stem are stripped of leading "N. " prefixes,
+    then compared with normalize_text() for diacritic-insensitive matching.
 
     Returns the updated workbook as bytes.
     """
     wb = load_workbook(summary_path)
     ws = wb.active
 
-    # Column indices (1-based) for F, G, H, K, L
-    COL_F = 6   # Tổng số
-    COL_G = 7   # Nam
-    COL_H = 8   # Nữ
-    COL_K = 11  # Cử tri 18 tuổi
-    COL_L = 12  # Cử tri cao tuổi
+    # ── Column indices (1-based, user-confirmed) ────────────────────────────
+    COL_NAME  = 3   # C = Tổ thôn, bản, khu phố (tên khu phố khớp với tên file)
+    COL_F     = 6   # Tổng số cử tri
+    COL_G     = 7   # Nam
+    COL_H     = 8   # Nữ
+    COL_K     = 11  # Cử tri 18 tuổi lần đầu bỏ phiếu
+    COL_L     = 12  # Cử tri cao tuổi (> 80 tuổi)
+    COL_M     = 13  # Bầu ĐBQH - Tổng số
+    COL_N     = 14  # Bầu ĐBQH - Nam
+    COL_O     = 15  # Bầu ĐBQH - Nữ
+    COL_P     = 16  # Bầu ĐBHĐND tỉnh - Tổng số
+    COL_Q     = 17  # Bầu ĐBHĐND tỉnh - Nam
+    COL_R     = 18  # Bầu ĐBHĐND tỉnh - Nữ
+    COL_S     = 19  # Bầu ĐBHĐND cấp xã - Tổng số
+    COL_T     = 20  # Bầu ĐBHĐND cấp xã - Nam
+    COL_U     = 21  # Bầu ĐBHĐND cấp xã - Nữ
 
-    # Try to auto-detect name column (fallback is col A=1 or B=2)
-    name_col = find_name_column(ws)
-    if name_col is None:
-        # Try columns A and B by looking for match
-        name_col = 1  # default
+    # Map from data key → column index (for clearing + writing)
+    DATA_COLS = [
+        ("tong",       COL_F),
+        ("nam",        COL_G),
+        ("nu",         COL_H),
+        ("ct18",       COL_K),
+        ("elderly",    COL_L),
+        ("qh_total",   COL_M),
+        ("qh_nam",     COL_N),
+        ("qh_nu",      COL_O),
+        ("tinh_total", COL_P),
+        ("tinh_nam",   COL_Q),
+        ("tinh_nu",    COL_R),
+        ("xa_total",   COL_S),
+        ("xa_nam",     COL_T),
+        ("xa_nu",      COL_U),
+    ]
+
+    # ── Build normalised lookup from data_map ────────────────────────────────
+    # Both the full key and the cleaned key are stored so either can match a row.
+    lookup: dict[str, tuple] = {}
+    for orig_key, data in data_map.items():
+        lookup[_name_key(orig_key)]          = (orig_key, data)
+        lookup[normalize_text(orig_key)]     = (orig_key, data)   # keep raw norm too
 
     updated_rows = 0
     for row in ws.iter_rows():
-        name_cell = row[name_col - 1]  # 0-indexed
+        if len(row) < COL_NAME:
+            continue
+        name_cell = row[COL_NAME - 1]   # 0-indexed → column C
         if not name_cell.value:
             continue
-        row_name_norm = normalize_text(str(name_cell.value))
 
-        # Try to find matching entry in data_map
-        matched_key = None
-        for key in data_map:
-            if key in row_name_norm or row_name_norm in key:
-                matched_key = key
-                break
-            # Fuzzy: check if key is substring or vice versa
-            if normalize_text(key) == row_name_norm:
-                matched_key = key
-                break
+        raw_name  = str(name_cell.value).strip()
+        norm_name = _name_key(raw_name)
 
-        if matched_key is None:
+        # 1) Exact match (normalised)
+        entry = lookup.get(norm_name)
+        # 2) Fuzzy match: substring + token overlap ≥ 60%
+        if entry is None:
+            entry = _fuzzy_match(norm_name, lookup, threshold=0.6)
+
+        if entry is None:
             continue
 
-        data = data_map[matched_key]
-        row_idx = name_cell.row
+        _, data = entry
+        row_idx  = name_cell.row
 
-        # Write values
-        if data.get("tong") is not None:
-            ws.cell(row=row_idx, column=COL_F).value = data["tong"]
-        if data.get("nam") is not None:
-            ws.cell(row=row_idx, column=COL_G).value = data["nam"]
-        if data.get("nu") is not None:
-            ws.cell(row=row_idx, column=COL_H).value = data["nu"]
-        if data.get("ct18") is not None:
-            ws.cell(row=row_idx, column=COL_K).value = data["ct18"]
-        if data.get("elderly") is not None:
-            ws.cell(row=row_idx, column=COL_L).value = data["elderly"]
+        # Clear existing values and write new ones
+        for key, col in DATA_COLS:
+            cell = ws.cell(row=row_idx, column=col)
+            cell.value = None                    # clear first
+            v = data.get(key)
+            if v is not None:
+                cell.value = v
 
         updated_rows += 1
         if log_fn:
-            log_fn(f"  ✅ Cập nhật hàng '{name_cell.value}': "
-                   f"Tổng={data.get('tong')}, Nam={data.get('nam')}, Nữ={data.get('nu')}, "
-                   f"CT18={data.get('ct18')}, Cao tuổi={data.get('elderly')}")
+            log_fn(f"  ✅ Cập nhật hàng '{raw_name}': "
+                   f"Tổng={data.get('tong')}, Nam={data.get('nam')}, "
+                   f"Nữ={data.get('nu')}, CT18={data.get('ct18')}, "
+                   f"Cao tuổi={data.get('elderly')}, "
+                   f"QH={data.get('qh_total')}, "
+                   f"HĐND tỉnh={data.get('tinh_total')}, "
+                   f"HĐND xã={data.get('xa_total')}")
 
     if log_fn:
         log_fn(f"\n📊 Tổng số hàng đã cập nhật: **{updated_rows}**")
 
-    # Save to buffer
     buf = io.BytesIO()
     wb.save(buf)
     buf.seek(0)
