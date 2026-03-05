@@ -363,26 +363,18 @@ def _parse_dob(cell_val) -> datetime.date | None:
     return None
 
 
-def _has_x(val) -> bool:
-    """Return True if cell contains an 'x' mark."""
-    return str(val or "").strip().lower() == "x"
+def _is_x(val) -> bool:
+    """True if cell contains 'x' or 'X' (case insensitive, space robust)."""
+    if val is None:
+        return False
+    return str(val).strip().lower() == "x"
 
 
-def count_voter_stats(ws: openpyxl.worksheet.worksheet.Worksheet) -> dict:
+def count_voter_stats(wb: openpyxl.Workbook) -> dict:
     """
-    Scan a specific voter-list sheet and return aggregated statistics matching the JS logic.
-
-    Source file column layout (1-based):
-      3  = Ngày sinh
-      4  = Nam (x mark)
-      5  = Nữ  (x mark)
-      11 = Bầu đại biểu Quốc hội       (x mark)
-      12 = Bầu đại biểu HĐND tỉnh      (x mark)
-      13 = Bầu đại biểu HĐND cấp xã    (x mark)
-
-    Date milestones (election 15/03/2026):
-      CT18:    DOB in [16/03/2007, 15/03/2008]
-      Cao tuổi: DOB < 16/03/1946  (tức sinh trước ngày này là trên 80 tuổi)
+    Scan all non-summary sheets in the workbook and return aggregated statistics.
+    Strictly counts 'x'/'X' marks. Ignores numbers.
+    Cross-references election marks (col 11-13) with gender marks (col 4-5).
     """
     stats = dict(
         ct18=0,
@@ -392,54 +384,65 @@ def count_voter_stats(ws: openpyxl.worksheet.worksheet.Worksheet) -> dict:
         xa_total=0,  xa_nam=0,  xa_nu=0,
     )
 
-    # Cutoff dates (matching JS constants)
+    # Cutoff dates
     DOB_18_FROM = datetime.date(2007, 3, 16)
     DOB_18_TO   = datetime.date(2008, 3, 15)
-    DOB_80_CUT  = datetime.date(1946, 3, 16)   # born BEFORE this → > 80 years old
+    DOB_80_CUT  = datetime.date(1946, 3, 16)
 
-    # Find the first data row (row 19+ per JS, but scan to be safe)
-    data_start = None
-    for row in ws.iter_rows(min_row=1, max_row=30, values_only=True):
-        row_idx = list(ws.iter_rows(min_row=1, max_row=30, values_only=True)).index(row) + 1
-        # Detect a row that looks like voter data: col 3 has a date
-        if _parse_dob(row[2] if len(row) > 2 else None) is not None:
-            data_start = row_idx
-            break
+    for sheetname in wb.sheetnames:
+        norm_s = normalize_text(sheetname)
+        # Skip master summary sheets
+        if "tong hop" in norm_s:
+            continue
+        ws = wb[sheetname]
 
-    if data_start is None:
-        data_start = 19   # JS default
+        # Find data start row (scan first 30 rows for a DOB)
+        data_start = 19
+        for idx, row in enumerate(ws.iter_rows(min_row=1, max_row=30, values_only=True)):
+            if _parse_dob(row[2] if len(row) > 2 else None):
+                data_start = idx + 1
+                break
 
-    for row in ws.iter_rows(min_row=data_start, values_only=True):
-        # Stop at totals/footer row
-        ho_ten = str(row[1] if len(row) > 1 else "").strip().lower()
-        if _STOP_KEYWORDS.search(ho_ten):
-            break
+        for row in ws.iter_rows(min_row=data_start, values_only=True):
+            # Stop at footer
+            ho_ten = str(row[1] if len(row) > 1 else "").strip().lower()
+            if _STOP_KEYWORDS.search(ho_ten):
+                break
 
-        dob    = _parse_dob(row[2] if len(row) > 2 else None)
-        co_nam = _has_x(row[3] if len(row) > 3 else None)
-        co_nu  = _has_x(row[4] if len(row) > 4 else None)
-        co_qh  = _has_x(row[10] if len(row) > 10 else None)
-        co_tinh = _has_x(row[11] if len(row) > 11 else None)
-        co_xa  = _has_x(row[12] if len(row) > 12 else None)
+            dob    = _parse_dob(row[2] if len(row) > 2 else None)
+            co_nam = _is_x(row[3] if len(row) > 3 else None)
+            co_nu  = _is_x(row[4] if len(row) > 4 else None)
+            
+            # Election marks (cols K=11, L=12, M=13)
+            # Use 0-based indices for row access: 10, 11, 12
+            co_qh   = _is_x(row[10] if len(row) > 10 else None)
+            co_tinh = _is_x(row[11] if len(row) > 11 else None)
+            co_xa   = _is_x(row[12] if len(row) > 12 else None)
 
-        if dob is not None:
-            if DOB_18_FROM <= dob <= DOB_18_TO:
-                stats["ct18"] += 1
-            if dob < DOB_80_CUT:
-                stats["elderly"] += 1
+            # Age groups
+            if dob:
+                if DOB_18_FROM <= dob <= DOB_18_TO:
+                    stats["ct18"] += 1
+                if dob < DOB_80_CUT:
+                    stats["elderly"] += 1
 
-        if co_qh:
-            stats["qh_total"] += 1
-            if co_nam: stats["qh_nam"] += 1
-            if co_nu:  stats["qh_nu"]  += 1
-        if co_tinh:
-            stats["tinh_total"] += 1
-            if co_nam: stats["tinh_nam"] += 1
-            if co_nu:  stats["tinh_nu"]  += 1
-        if co_xa:
-            stats["xa_total"] += 1
-            if co_nam: stats["xa_nam"] += 1
-            if co_nu:  stats["xa_nu"]  += 1
+            # National Assembly (QH)
+            if co_qh:
+                stats["qh_total"] += 1
+                if co_nam: stats["qh_nam"] += 1
+                if co_nu:  stats["qh_nu"]  += 1
+
+            # Provincial (Tinh)
+            if co_tinh:
+                stats["tinh_total"] += 1
+                if co_nam: stats["tinh_nam"] += 1
+                if co_nu:  stats["tinh_nu"]  += 1
+
+            # Local (Xa/Phuong)
+            if co_xa:
+                stats["xa_total"] += 1
+                if co_nam: stats["xa_nam"] += 1
+                if co_nu:  stats["xa_nu"]  += 1
 
     return stats
 
@@ -492,13 +495,11 @@ def process_source_file(filepath: str) -> dict:
         result["nu"]   = totals["nu"]
 
         # --- Count full voter stats (age groups + voting categories) ---
-        # ONLY scan the specific sheet where the total was found to avoid double-counting
-        if found_ws:
-            try:
-                stats = count_voter_stats(found_ws)
-                result.update(stats)
-            except Exception:
-                pass   # non-fatal – leave as None
+        try:
+            stats = count_voter_stats(wb)
+            result.update(stats)
+        except Exception:
+            pass   # non-fatal – leave as None
 
     return result
 
