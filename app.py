@@ -486,11 +486,47 @@ def process_source_file(filepath: str) -> dict:
         result["nam"]  = totals["nam"]
         result["nu"]   = totals["nu"]
 
-        # --- Count full voter stats from the SAME sheet where totals were found ---
-        # This prevents double-counting from multiple Tổ sheets
-        if found_ws:
+        # --- Count voter stats from the VOTER LIST sheet (not the text-summary sheet) ---
+        # found_ws may be the 'Tổng Hợp' text-summary (no individual rows).
+        # We need to find the sheet that has actual voter rows: DOB in col C + x marks.
+        stats_ws = None
+
+        # Priority 1: look for a sheet named 'Tổng' (the aggregate voter list)
+        for sheetname in wb.sheetnames:
+            n = normalize_text(sheetname)
+            if n in {"tong", "sheet tong"} or (n.startswith("tong") and "hop" not in n):
+                cand = wb[sheetname]
+                # Verify it has DOB data
+                for r in cand.iter_rows(min_row=1, max_row=30, values_only=True):
+                    if _parse_dob(r[2] if len(r) > 2 else None):
+                        stats_ws = cand
+                        break
+                if stats_ws:
+                    break
+
+        # Priority 2: fall back to found_ws if it has voter rows
+        if stats_ws is None and found_ws:
+            for r in found_ws.iter_rows(min_row=1, max_row=30, values_only=True):
+                if _parse_dob(r[2] if len(r) > 2 else None):
+                    stats_ws = found_ws
+                    break
+
+        # Priority 3: scan all sheets and pick first one with DOBs
+        if stats_ws is None:
+            for sheetname in wb.sheetnames:
+                if "tong hop" in normalize_text(sheetname):
+                    continue
+                cand = wb[sheetname]
+                for r in cand.iter_rows(min_row=1, max_row=30, values_only=True):
+                    if _parse_dob(r[2] if len(r) > 2 else None):
+                        stats_ws = cand
+                        break
+                if stats_ws:
+                    break
+
+        if stats_ws:
             try:
-                stats = count_voter_stats(found_ws)
+                stats = count_voter_stats(stats_ws)
                 result.update(stats)
             except Exception:
                 pass   # non-fatal – leave as None
