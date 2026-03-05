@@ -370,11 +370,12 @@ def _is_x(val) -> bool:
     return str(val).strip().lower() == "x"
 
 
-def count_voter_stats(wb: openpyxl.Workbook) -> dict:
+def count_voter_stats(ws: openpyxl.worksheet.worksheet.Worksheet) -> dict:
     """
-    Scan all non-summary sheets in the workbook and return aggregated statistics.
-    Strictly counts 'x'/'X' marks. Ignores numbers.
-    Cross-references election marks (col 11-13) with gender marks (col 4-5).
+    Scan ONE specific sheet (the Tổng/aggregate sheet) and count voter statistics.
+    Strictly counts 'x'/'X' marks only — ignores numbers.
+    Gender breakdown from columns D (Nam) and E (Nữ).
+    Election columns K (QH), L (Tinh), M (Phường/Xã).
     """
     stats = dict(
         ct18=0,
@@ -384,65 +385,56 @@ def count_voter_stats(wb: openpyxl.Workbook) -> dict:
         xa_total=0,  xa_nam=0,  xa_nu=0,
     )
 
-    # Cutoff dates
     DOB_18_FROM = datetime.date(2007, 3, 16)
     DOB_18_TO   = datetime.date(2008, 3, 15)
     DOB_80_CUT  = datetime.date(1946, 3, 16)
 
-    for sheetname in wb.sheetnames:
-        norm_s = normalize_text(sheetname)
-        # Skip master summary sheets
-        if "tong hop" in norm_s:
-            continue
-        ws = wb[sheetname]
+    # Find data start row by looking for first row with a DOB in col C (index 2)
+    data_start = 19
+    for idx, row in enumerate(ws.iter_rows(min_row=1, max_row=30, values_only=True)):
+        if _parse_dob(row[2] if len(row) > 2 else None):
+            data_start = idx + 1
+            break
 
-        # Find data start row (scan first 30 rows for a DOB)
-        data_start = 19
-        for idx, row in enumerate(ws.iter_rows(min_row=1, max_row=30, values_only=True)):
-            if _parse_dob(row[2] if len(row) > 2 else None):
-                data_start = idx + 1
-                break
+    for row in ws.iter_rows(min_row=data_start, values_only=True):
+        # Stop at footer rows (Tổng số, Người lập biểu, ...)
+        ho_ten = str(row[1] if len(row) > 1 else "").strip().lower()
+        if _STOP_KEYWORDS.search(ho_ten):
+            break
 
-        for row in ws.iter_rows(min_row=data_start, values_only=True):
-            # Stop at footer
-            ho_ten = str(row[1] if len(row) > 1 else "").strip().lower()
-            if _STOP_KEYWORDS.search(ho_ten):
-                break
+        dob    = _parse_dob(row[2] if len(row) > 2 else None)
+        co_nam = _is_x(row[3] if len(row) > 3 else None)   # col D = Nam
+        co_nu  = _is_x(row[4] if len(row) > 4 else None)   # col E = Nữ
 
-            dob    = _parse_dob(row[2] if len(row) > 2 else None)
-            co_nam = _is_x(row[3] if len(row) > 3 else None)
-            co_nu  = _is_x(row[4] if len(row) > 4 else None)
-            
-            # Election marks (cols K=11, L=12, M=13)
-            # Use 0-based indices for row access: 10, 11, 12
-            co_qh   = _is_x(row[10] if len(row) > 10 else None)
-            co_tinh = _is_x(row[11] if len(row) > 11 else None)
-            co_xa   = _is_x(row[12] if len(row) > 12 else None)
+        # Election columns (1-based: K=11, L=12, M=13 → 0-based: 10, 11, 12)
+        co_qh   = _is_x(row[10] if len(row) > 10 else None)  # K - Bầu ĐBQH
+        co_tinh = _is_x(row[11] if len(row) > 11 else None)  # L - Bầu HĐND tỉnh
+        co_xa   = _is_x(row[12] if len(row) > 12 else None)  # M - Bầu HĐND phường/xã
 
-            # Age groups
-            if dob:
-                if DOB_18_FROM <= dob <= DOB_18_TO:
-                    stats["ct18"] += 1
-                if dob < DOB_80_CUT:
-                    stats["elderly"] += 1
+        # Age groups
+        if dob:
+            if DOB_18_FROM <= dob <= DOB_18_TO:
+                stats["ct18"] += 1
+            if dob < DOB_80_CUT:
+                stats["elderly"] += 1
 
-            # National Assembly (QH)
-            if co_qh:
-                stats["qh_total"] += 1
-                if co_nam: stats["qh_nam"] += 1
-                if co_nu:  stats["qh_nu"]  += 1
+        # National Assembly (QH)
+        if co_qh:
+            stats["qh_total"] += 1
+            if co_nam: stats["qh_nam"] += 1
+            if co_nu:  stats["qh_nu"]  += 1
 
-            # Provincial (Tinh)
-            if co_tinh:
-                stats["tinh_total"] += 1
-                if co_nam: stats["tinh_nam"] += 1
-                if co_nu:  stats["tinh_nu"]  += 1
+        # Provincial (Tinh)
+        if co_tinh:
+            stats["tinh_total"] += 1
+            if co_nam: stats["tinh_nam"] += 1
+            if co_nu:  stats["tinh_nu"]  += 1
 
-            # Local (Xa/Phuong)
-            if co_xa:
-                stats["xa_total"] += 1
-                if co_nam: stats["xa_nam"] += 1
-                if co_nu:  stats["xa_nu"]  += 1
+        # Local (Phường/Xã)
+        if co_xa:
+            stats["xa_total"] += 1
+            if co_nam: stats["xa_nam"] += 1
+            if co_nu:  stats["xa_nu"]  += 1
 
     return stats
 
@@ -494,12 +486,14 @@ def process_source_file(filepath: str) -> dict:
         result["nam"]  = totals["nam"]
         result["nu"]   = totals["nu"]
 
-        # --- Count full voter stats (age groups + voting categories) ---
-        try:
-            stats = count_voter_stats(wb)
-            result.update(stats)
-        except Exception:
-            pass   # non-fatal – leave as None
+        # --- Count full voter stats from the SAME sheet where totals were found ---
+        # This prevents double-counting from multiple Tổ sheets
+        if found_ws:
+            try:
+                stats = count_voter_stats(found_ws)
+                result.update(stats)
+            except Exception:
+                pass   # non-fatal – leave as None
 
     return result
 
