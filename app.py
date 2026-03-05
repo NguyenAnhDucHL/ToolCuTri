@@ -368,9 +368,9 @@ def _has_x(val) -> bool:
     return str(val or "").strip().lower() == "x"
 
 
-def count_voter_stats(wb: openpyxl.Workbook) -> dict:
+def count_voter_stats(ws: openpyxl.worksheet.worksheet.Worksheet) -> dict:
     """
-    Scan voter-list sheets and return aggregated statistics matching the JS logic.
+    Scan a specific voter-list sheet and return aggregated statistics matching the JS logic.
 
     Source file column layout (1-based):
       3  = Ngày sinh
@@ -397,56 +397,49 @@ def count_voter_stats(wb: openpyxl.Workbook) -> dict:
     DOB_18_TO   = datetime.date(2008, 3, 15)
     DOB_80_CUT  = datetime.date(1946, 3, 16)   # born BEFORE this → > 80 years old
 
-    # Scan every sheet that is NOT a summary sheet
-    for sheetname in wb.sheetnames:
-        norm = normalize_text(sheetname)
-        if "tong hop" in norm:
-            continue   # skip summary sheets
-        ws = wb[sheetname]
+    # Find the first data row (row 19+ per JS, but scan to be safe)
+    data_start = None
+    for row in ws.iter_rows(min_row=1, max_row=30, values_only=True):
+        row_idx = list(ws.iter_rows(min_row=1, max_row=30, values_only=True)).index(row) + 1
+        # Detect a row that looks like voter data: col 3 has a date
+        if _parse_dob(row[2] if len(row) > 2 else None) is not None:
+            data_start = row_idx
+            break
 
-        # Find the first data row (row 19+ per JS, but scan to be safe)
-        data_start = None
-        for row in ws.iter_rows(min_row=1, max_row=30, values_only=True):
-            row_idx = list(ws.iter_rows(min_row=1, max_row=30, values_only=True)).index(row) + 1
-            # Detect a row that looks like voter data: col 3 has a date
-            if _parse_dob(row[2] if len(row) > 2 else None) is not None:
-                data_start = row_idx
-                break
+    if data_start is None:
+        data_start = 19   # JS default
 
-        if data_start is None:
-            data_start = 19   # JS default
+    for row in ws.iter_rows(min_row=data_start, values_only=True):
+        # Stop at totals/footer row
+        ho_ten = str(row[1] if len(row) > 1 else "").strip().lower()
+        if _STOP_KEYWORDS.search(ho_ten):
+            break
 
-        for row in ws.iter_rows(min_row=data_start, values_only=True):
-            # Stop at totals/footer row
-            ho_ten = str(row[1] if len(row) > 1 else "").strip().lower()
-            if _STOP_KEYWORDS.search(ho_ten):
-                break
+        dob    = _parse_dob(row[2] if len(row) > 2 else None)
+        co_nam = _has_x(row[3] if len(row) > 3 else None)
+        co_nu  = _has_x(row[4] if len(row) > 4 else None)
+        co_qh  = _has_x(row[10] if len(row) > 10 else None)
+        co_tinh = _has_x(row[11] if len(row) > 11 else None)
+        co_xa  = _has_x(row[12] if len(row) > 12 else None)
 
-            dob    = _parse_dob(row[2] if len(row) > 2 else None)
-            co_nam = _has_x(row[3] if len(row) > 3 else None)
-            co_nu  = _has_x(row[4] if len(row) > 4 else None)
-            co_qh  = _has_x(row[10] if len(row) > 10 else None)
-            co_tinh = _has_x(row[11] if len(row) > 11 else None)
-            co_xa  = _has_x(row[12] if len(row) > 12 else None)
+        if dob is not None:
+            if DOB_18_FROM <= dob <= DOB_18_TO:
+                stats["ct18"] += 1
+            if dob < DOB_80_CUT:
+                stats["elderly"] += 1
 
-            if dob is not None:
-                if DOB_18_FROM <= dob <= DOB_18_TO:
-                    stats["ct18"] += 1
-                if dob < DOB_80_CUT:
-                    stats["elderly"] += 1
-
-            if co_qh:
-                stats["qh_total"] += 1
-                if co_nam: stats["qh_nam"] += 1
-                if co_nu:  stats["qh_nu"]  += 1
-            if co_tinh:
-                stats["tinh_total"] += 1
-                if co_nam: stats["tinh_nam"] += 1
-                if co_nu:  stats["tinh_nu"]  += 1
-            if co_xa:
-                stats["xa_total"] += 1
-                if co_nam: stats["xa_nam"] += 1
-                if co_nu:  stats["xa_nu"]  += 1
+        if co_qh:
+            stats["qh_total"] += 1
+            if co_nam: stats["qh_nam"] += 1
+            if co_nu:  stats["qh_nu"]  += 1
+        if co_tinh:
+            stats["tinh_total"] += 1
+            if co_nam: stats["tinh_nam"] += 1
+            if co_nu:  stats["tinh_nu"]  += 1
+        if co_xa:
+            stats["xa_total"] += 1
+            if co_nam: stats["xa_nam"] += 1
+            if co_nu:  stats["xa_nu"]  += 1
 
     return stats
 
@@ -481,10 +474,12 @@ def process_source_file(filepath: str) -> dict:
     candidates = get_candidate_sheets(wb)
     totals = None
     tried_sheets = []
+    found_ws = None
     for ws in candidates:
         tried_sheets.append(ws.title)
         totals = find_total_row(ws, wb_formulas=wb_formulas)
         if totals:
+            found_ws = ws
             break
 
     if totals is None:
@@ -496,12 +491,14 @@ def process_source_file(filepath: str) -> dict:
         result["nam"]  = totals["nam"]
         result["nu"]   = totals["nu"]
 
-    # --- Count full voter stats (age groups + voting categories) ---
-    try:
-        stats = count_voter_stats(wb)
-        result.update(stats)
-    except Exception:
-        pass   # non-fatal – leave as None
+        # --- Count full voter stats (age groups + voting categories) ---
+        # ONLY scan the specific sheet where the total was found to avoid double-counting
+        if found_ws:
+            try:
+                stats = count_voter_stats(found_ws)
+                result.update(stats)
+            except Exception:
+                pass   # non-fatal – leave as None
 
     return result
 
