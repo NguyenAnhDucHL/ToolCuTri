@@ -414,10 +414,16 @@ def count_voter_stats(ws: openpyxl.worksheet.worksheet.Worksheet) -> dict:
         if _STOP_KEYWORDS.search(col_b):
             break
 
-        # Skip empty rows and non-voter rows (no DOB)
+        # We shouldn't skip the row purely because DOB parsing fails. 
+        # Sometimes DOB is malformed (e.g. "1975", "28//2004"). 
+        # Check if they have a name in col B OR some raw text in col C
+        has_name = bool(str(row[1]).strip()) if len(row) > 1 and row[1] else False
+        has_raw_dob = bool(str(row[2]).strip()) if len(row) > 2 and row[2] else False
+        
         dob = _parse_dob(row[2] if len(row) > 2 else None)
-        if dob is None:
-            continue   # not a voter row — skip
+        
+        if not has_name and not has_raw_dob:
+            continue   # not a voter row (both name and DOB are completely empty)
 
         co_nam = _is_x(row[3] if len(row) > 3 else None)   # D = Nam
         co_nu  = _is_x(row[4] if len(row) > 4 else None)   # E = Nữ
@@ -428,10 +434,11 @@ def count_voter_stats(ws: openpyxl.worksheet.worksheet.Worksheet) -> dict:
         if co_nu:  stats["nu"]  += 1
 
         # ── Age groups (K, L in summary) ────────────────────────────────────
-        if DOB_18_FROM <= dob <= DOB_18_TO:
-            stats["ct18"] += 1
-        if dob < DOB_80_CUT:
-            stats["elderly"] += 1
+        if dob:
+            if DOB_18_FROM <= dob <= DOB_18_TO:
+                stats["ct18"] += 1
+            if dob < DOB_80_CUT:
+                stats["elderly"] += 1
 
         # ── Election marks (M-U in summary) ─────────────────────────────────
         co_qh   = _is_x(row[10] if len(row) > 10 else None)  # K = QH
