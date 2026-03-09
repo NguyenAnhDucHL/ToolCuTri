@@ -364,73 +364,88 @@ def _parse_dob(cell_val) -> datetime.date | None:
 
 
 def _is_x(val) -> bool:
-    """True if cell contains 'x' or 'X' (case insensitive, space robust)."""
+    """True if cell contains 'x' or 'X' (ignores spaces, dots, dashes... around 'x')."""
     if val is None:
         return False
-    return str(val).strip().lower() == "x"
+    return "x" in str(val).lower()
 
 
 def count_voter_stats(ws: openpyxl.worksheet.worksheet.Worksheet) -> dict:
     """
-    Scan ONE specific sheet (the Tổng/aggregate sheet) and count voter statistics.
-    Strictly counts 'x'/'X' marks only — ignores numbers.
-    Gender breakdown from columns D (Nam) and E (Nữ).
-    Election columns K (QH), L (Tinh), M (Phường/Xã).
+    Scan ONE voter-list sheet (Tổng or Tổng Hợp) and return ALL stats in one pass.
+
+    Column layout (1-based):
+      A(1) = STT       B(2) = Họ tên   C(3) = Ngày sinh
+      D(4) = Nam (x)   E(5) = Nữ  (x)
+      K(11) = Bầu ĐBQH (x)
+      L(12) = Bầu HĐND tỉnh (x)
+      M(13) = Bầu HĐND phường/xã (x)
+
+    Returns:
+      tong, nam, nu       → for columns F, G, H
+      ct18, elderly       → for columns K, L in summary
+      qh_total/nam/nu     → for columns M, N, O
+      tinh_total/nam/nu   → for columns P, Q, R
+      xa_total/nam/nu     → for columns S, T, U
     """
     stats = dict(
-        ct18=0,
-        elderly=0,
-        qh_total=0,  qh_nam=0,  qh_nu=0,
+        tong=0,  nam=0,  nu=0,
+        ct18=0,  elderly=0,
+        qh_total=0,   qh_nam=0,   qh_nu=0,
         tinh_total=0, tinh_nam=0, tinh_nu=0,
-        xa_total=0,  xa_nam=0,  xa_nu=0,
+        xa_total=0,   xa_nam=0,   xa_nu=0,
     )
 
     DOB_18_FROM = datetime.date(2007, 3, 16)
     DOB_18_TO   = datetime.date(2008, 3, 15)
     DOB_80_CUT  = datetime.date(1946, 3, 16)
 
-    # Find data start row by looking for first row with a DOB in col C (index 2)
+    # ── Find data start: first row where col C has a valid DOB ───────────────
     data_start = 19
-    for idx, row in enumerate(ws.iter_rows(min_row=1, max_row=30, values_only=True)):
+    for idx, row in enumerate(ws.iter_rows(min_row=1, max_row=50, values_only=True)):
         if _parse_dob(row[2] if len(row) > 2 else None):
             data_start = idx + 1
             break
 
+    # ── Single pass over all voter rows ─────────────────────────────────────
     for row in ws.iter_rows(min_row=data_start, values_only=True):
-        # Stop at footer rows (Tổng số, Người lập biểu, ...)
-        ho_ten = str(row[1] if len(row) > 1 else "").strip().lower()
-        if _STOP_KEYWORDS.search(ho_ten):
+        # Stop at footer (e.g. "Tổng số cử tri", "Người lập biểu")
+        col_b = str(row[1] if len(row) > 1 else "").strip().lower()
+        if _STOP_KEYWORDS.search(col_b):
             break
 
-        dob    = _parse_dob(row[2] if len(row) > 2 else None)
-        co_nam = _is_x(row[3] if len(row) > 3 else None)   # col D = Nam
-        co_nu  = _is_x(row[4] if len(row) > 4 else None)   # col E = Nữ
+        # Skip empty rows and non-voter rows (no DOB)
+        dob = _parse_dob(row[2] if len(row) > 2 else None)
+        if dob is None:
+            continue   # not a voter row — skip
 
-        # Election columns (1-based: K=11, L=12, M=13 → 0-based: 10, 11, 12)
-        co_qh   = _is_x(row[10] if len(row) > 10 else None)  # K - Bầu ĐBQH
-        co_tinh = _is_x(row[11] if len(row) > 11 else None)  # L - Bầu HĐND tỉnh
-        co_xa   = _is_x(row[12] if len(row) > 12 else None)  # M - Bầu HĐND phường/xã
+        co_nam = _is_x(row[3] if len(row) > 3 else None)   # D = Nam
+        co_nu  = _is_x(row[4] if len(row) > 4 else None)   # E = Nữ
 
-        # Age groups
-        if dob:
-            if DOB_18_FROM <= dob <= DOB_18_TO:
-                stats["ct18"] += 1
-            if dob < DOB_80_CUT:
-                stats["elderly"] += 1
+        # ── F, G, H: total count ────────────────────────────────────────────
+        stats["tong"] += 1
+        if co_nam: stats["nam"] += 1
+        if co_nu:  stats["nu"]  += 1
 
-        # National Assembly (QH)
+        # ── Age groups (K, L in summary) ────────────────────────────────────
+        if DOB_18_FROM <= dob <= DOB_18_TO:
+            stats["ct18"] += 1
+        if dob < DOB_80_CUT:
+            stats["elderly"] += 1
+
+        # ── Election marks (M-U in summary) ─────────────────────────────────
+        co_qh   = _is_x(row[10] if len(row) > 10 else None)  # K = QH
+        co_tinh = _is_x(row[11] if len(row) > 11 else None)  # L = Tinh
+        co_xa   = _is_x(row[12] if len(row) > 12 else None)  # M = Phường/Xã
+
         if co_qh:
             stats["qh_total"] += 1
             if co_nam: stats["qh_nam"] += 1
             if co_nu:  stats["qh_nu"]  += 1
-
-        # Provincial (Tinh)
         if co_tinh:
             stats["tinh_total"] += 1
             if co_nam: stats["tinh_nam"] += 1
             if co_nu:  stats["tinh_nu"]  += 1
-
-        # Local (Phường/Xã)
         if co_xa:
             stats["xa_total"] += 1
             if co_nam: stats["xa_nam"] += 1
@@ -439,11 +454,40 @@ def count_voter_stats(ws: openpyxl.worksheet.worksheet.Worksheet) -> dict:
     return stats
 
 
+def _find_voter_list_sheet(wb: openpyxl.Workbook):
+    """
+    Find the best voter-list sheet to scan for 'x' marks.
+    Priority order:
+      1. Sheet named 'Tổng Hợp' / 'Tổng hợp cử tri' (aggregate list with all rows)
+      2. Sheet named 'Tổng' (combined total list)
+      3. Any other non-summary sheet that contains DOB data
+    Returns a Worksheet or None.
+    """
+    # Build ordered search list: named 'tong hop' first, then 'tong', then others
+    named_tong_hop, named_tong, others = [], [], []
+    for sheetname in wb.sheetnames:
+        n = normalize_text(sheetname)
+        if "tong hop" in n:
+            named_tong_hop.append(sheetname)
+        elif n in {"tong", "sheet tong"} or (n.startswith("tong") and "hop" not in n):
+            named_tong.append(sheetname)
+        else:
+            others.append(sheetname)
+
+    for sheetname in named_tong_hop + named_tong + others:
+        ws = wb[sheetname]
+        for row in ws.iter_rows(min_row=1, max_row=50, values_only=True):
+            if _parse_dob(row[2] if len(row) > 2 else None):
+                return ws   # found a sheet with DOB data
+    return None
+
+
 def process_source_file(filepath: str) -> dict:
     """
-    Read a source .xlsx file and return extracted data.
-    Uses data_only=True for values + also loads without data_only for formula fallback.
-    Tries ALL candidate sheets in priority order until Tổng/Nam/Nữ is found.
+    Read a source .xlsx file and return all extracted voter statistics.
+    Uses the new unified strategy:
+      1. Find the voter-list sheet (Tổng Hợp → Tổng → other)
+      2. One pass over voter rows to get F/G/H + K-U stats
     """
     result = {
         "tong": None, "nam": None, "nu": None,
@@ -459,77 +503,21 @@ def process_source_file(filepath: str) -> dict:
         result["error"] = f"Không mở được file: {e}"
         return result
 
-    # Load formula version as fallback (for cells where data_only returns None)
+    # Find the voter-list sheet to scan
+    voter_ws = _find_voter_list_sheet(wb)
+    if voter_ws is None:
+        result["error"] = "Không tìm thấy sheet có dữ liệu cử tri (ngày sinh)"
+        return result
+
     try:
-        wb_formulas = load_workbook(filepath, data_only=False)
-    except Exception:
-        wb_formulas = None
-
-    # --- Find Tổng / Nam / Nữ: try each candidate sheet in priority order ---
-    candidates = get_candidate_sheets(wb)
-    totals = None
-    tried_sheets = []
-    found_ws = None
-    for ws in candidates:
-        tried_sheets.append(ws.title)
-        totals = find_total_row(ws, wb_formulas=wb_formulas)
-        if totals:
-            found_ws = ws
-            break
-
-    if totals is None:
-        result["error"] = (
-            f"Không tìm được Tổng/Nam/Nữ trong các sheet: {tried_sheets}"
-        )
-    else:
-        result["tong"] = totals["tong"]
-        result["nam"]  = totals["nam"]
-        result["nu"]   = totals["nu"]
-
-        # --- Count voter stats from the VOTER LIST sheet (not the text-summary sheet) ---
-        # found_ws may be the 'Tổng Hợp' text-summary (no individual rows).
-        # We need to find the sheet that has actual voter rows: DOB in col C + x marks.
-        stats_ws = None
-
-        # Priority 1: look for a sheet named 'Tổng' (the aggregate voter list)
-        for sheetname in wb.sheetnames:
-            n = normalize_text(sheetname)
-            if n in {"tong", "sheet tong"} or (n.startswith("tong") and "hop" not in n):
-                cand = wb[sheetname]
-                # Verify it has DOB data
-                for r in cand.iter_rows(min_row=1, max_row=30, values_only=True):
-                    if _parse_dob(r[2] if len(r) > 2 else None):
-                        stats_ws = cand
-                        break
-                if stats_ws:
-                    break
-
-        # Priority 2: fall back to found_ws if it has voter rows
-        if stats_ws is None and found_ws:
-            for r in found_ws.iter_rows(min_row=1, max_row=30, values_only=True):
-                if _parse_dob(r[2] if len(r) > 2 else None):
-                    stats_ws = found_ws
-                    break
-
-        # Priority 3: scan all sheets and pick first one with DOBs
-        if stats_ws is None:
-            for sheetname in wb.sheetnames:
-                if "tong hop" in normalize_text(sheetname):
-                    continue
-                cand = wb[sheetname]
-                for r in cand.iter_rows(min_row=1, max_row=30, values_only=True):
-                    if _parse_dob(r[2] if len(r) > 2 else None):
-                        stats_ws = cand
-                        break
-                if stats_ws:
-                    break
-
-        if stats_ws:
-            try:
-                stats = count_voter_stats(stats_ws)
-                result.update(stats)
-            except Exception:
-                pass   # non-fatal – leave as None
+        stats = count_voter_stats(voter_ws)
+        # Only update non-zero values so None stays if truly nothing found
+        if stats["tong"] > 0:
+            result.update(stats)
+        else:
+            result["error"] = f"Sheet '{voter_ws.title}': không đếm được cử tri (0 hàng)"
+    except Exception as e:
+        result["error"] = f"Lỗi khi đọc sheet '{voter_ws.title}': {e}"
 
     return result
 
