@@ -343,7 +343,7 @@ def find_total_row(ws, wb_formulas=None) -> dict | None:
 
 
 _STOP_KEYWORDS = re.compile(
-    r"t[oô]ng\s*s[oô]\s*c[uư]\s*tri|c[uư]\s*tri\s*tham\s*gia|danh\s*s[aá]ch\s*[dđ][uư][oơ]c\s*l[aâ]p|ng[uư][oơ]i\s*l[aâ]p\s*bi[eê]u",
+    r"tong\s*so\s*cu\s*tri|cu\s*tri\s*tham\s*gia|danh\s*sach\s*duoc\s*lap|nguoi\s*lap\s*bieu",
     re.IGNORECASE | re.UNICODE,
 )
 
@@ -410,7 +410,7 @@ def count_voter_stats(ws: openpyxl.worksheet.worksheet.Worksheet) -> dict:
     # ── Single pass over all voter rows ─────────────────────────────────────
     for row in ws.iter_rows(min_row=data_start, values_only=True):
         # Stop at footer (e.g. "Tổng số cử tri", "Người lập biểu")
-        col_b = str(row[1] if len(row) > 1 else "").strip().lower()
+        col_b = normalize_text(str(row[1] if len(row) > 1 else ""))
         if _STOP_KEYWORDS.search(col_b):
             break
 
