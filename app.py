@@ -489,13 +489,9 @@ def _find_voter_list_sheet(wb: openpyxl.Workbook):
     return None
 
 
-def process_source_file(filepath: str) -> dict:
-    """
-    Read a source .xlsx file and return all extracted voter statistics.
-    Uses the new unified strategy:
-      1. Find the voter-list sheet (Tổng Hợp → Tổng → other)
-      2. One pass over voter rows to get F/G/H + K-U stats
-    """
+@st.cache_data(show_spinner=False, ttl=3600*24)
+def _process_source_bytes(file_bytes: bytes) -> dict:
+    """Core logic extracted to allow robust caching based on file contents."""
     result = {
         "tong": None, "nam": None, "nu": None,
         "ct18": None, "elderly": None,
@@ -505,12 +501,11 @@ def process_source_file(filepath: str) -> dict:
         "error": None,
     }
     try:
-        wb = load_workbook(filepath, data_only=True)
+        wb = load_workbook(io.BytesIO(file_bytes), data_only=True)
     except Exception as e:
         result["error"] = f"Không mở được file: {e}"
         return result
 
-    # Find the voter-list sheet to scan
     voter_ws = _find_voter_list_sheet(wb)
     if voter_ws is None:
         result["error"] = "Không tìm thấy sheet có dữ liệu cử tri (ngày sinh)"
@@ -518,7 +513,6 @@ def process_source_file(filepath: str) -> dict:
 
     try:
         stats = count_voter_stats(voter_ws)
-        # Only update non-zero values so None stays if truly nothing found
         if stats["tong"] > 0:
             result.update(stats)
         else:
@@ -527,6 +521,18 @@ def process_source_file(filepath: str) -> dict:
         result["error"] = f"Lỗi khi đọc sheet '{voter_ws.title}': {e}"
 
     return result
+
+def process_source_file(filepath: str) -> dict:
+    """
+    Read a source .xlsx file and return all extracted voter statistics.
+    Converts file to bytes first to utilize Streamlit's robust content-based caching.
+    """
+    try:
+        with open(filepath, "rb") as f:
+            file_bytes = f.read()
+        return _process_source_bytes(file_bytes)
+    except Exception as e:
+        return {"error": f"Lỗi đọc file từ đĩa: {e}"}
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -578,20 +584,33 @@ def _name_key(name: str) -> str:
 def _token_overlap(a: str, b: str) -> float:
     """
     Return the Jaccard-like token overlap between two normalised strings.
-    tokenises on whitespace; ignores single-char tokens (except for numbers).
-    Returns value in [0, 1].
-    Specifically checks trailing numbers to avert 'Dong Tien 1' matching 'Dong Tien 2'.
+    Return 0.0 aggressively if trailing identifiers mismatch (e.g. '1' vs '2')
+    or if core contrasting words exist (e.g. 'Tien' vs 'Hai').
     """
+    stop = {'khu', 'pho', 'to', 'thon', 'ban', 'đon', 'vi', 'bau', 'cu', 'so', 'phuong', 'xa', 'ap', 'tô'}
+    
     tokens_a = a.split()
     tokens_b = b.split()
     
-    # Extract trailing numbers if they exist
-    num_a = tokens_a[-1] if tokens_a and tokens_a[-1].isdigit() else (tokens_a[-2] if len(tokens_a)>1 and tokens_a[-2].isdigit() and tokens_a[-1]=='.xlsx' else None)
-    num_b = tokens_b[-1] if tokens_b and tokens_b[-1].isdigit() else (tokens_b[-2] if len(tokens_b)>1 and tokens_b[-2].isdigit() and tokens_b[-1]=='.xlsx' else None)
+    def get_id_token(tokens):
+        if not tokens: return None
+        if any(c.isdigit() for c in tokens[-1]): return tokens[-1]
+        if len(tokens) > 1 and any(c.isdigit() for c in tokens[-2]) and tokens[-1] == '.xlsx': return tokens[-2]
+        return None
+
+    num_a = get_id_token(tokens_a)
+    num_b = get_id_token(tokens_b)
     
-    # If both have numeric identifiers at the end and they don't match, they are different zones!
     if num_a and num_b and num_a != num_b:
         return 0.0
+
+    core_a = {t for t in tokens_a if t not in stop and not any(c.isdigit() for c in t) and not t.endswith('.xlsx')}
+    core_b = {t for t in tokens_b if t not in stop and not any(c.isdigit() for c in t) and not t.endswith('.xlsx')}
+    
+    if core_a and core_b:
+        if (core_a - core_b) and (core_b - core_a):
+            # Contradicting distinct names detected
+            return 0.0
 
     ta = {t for t in tokens_a if len(t) > 1 or t.isdigit()}
     tb = {t for t in tokens_b if len(t) > 1 or t.isdigit()}
