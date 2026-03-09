@@ -578,13 +578,27 @@ def _name_key(name: str) -> str:
 def _token_overlap(a: str, b: str) -> float:
     """
     Return the Jaccard-like token overlap between two normalised strings.
-    tokenises on whitespace; ignores single-char tokens.
+    tokenises on whitespace; ignores single-char tokens (except for numbers).
     Returns value in [0, 1].
+    Specifically checks trailing numbers to avert 'Dong Tien 1' matching 'Dong Tien 2'.
     """
-    ta = {t for t in a.split() if len(t) > 1}
-    tb = {t for t in b.split() if len(t) > 1}
+    tokens_a = a.split()
+    tokens_b = b.split()
+    
+    # Extract trailing numbers if they exist
+    num_a = tokens_a[-1] if tokens_a and tokens_a[-1].isdigit() else (tokens_a[-2] if len(tokens_a)>1 and tokens_a[-2].isdigit() and tokens_a[-1]=='.xlsx' else None)
+    num_b = tokens_b[-1] if tokens_b and tokens_b[-1].isdigit() else (tokens_b[-2] if len(tokens_b)>1 and tokens_b[-2].isdigit() and tokens_b[-1]=='.xlsx' else None)
+    
+    # If both have numeric identifiers at the end and they don't match, they are different zones!
+    if num_a and num_b and num_a != num_b:
+        return 0.0
+
+    ta = {t for t in tokens_a if len(t) > 1 or t.isdigit()}
+    tb = {t for t in tokens_b if len(t) > 1 or t.isdigit()}
+    
     if not ta or not tb:
         return 0.0
+        
     return len(ta & tb) / max(len(ta), len(tb))
 
 
