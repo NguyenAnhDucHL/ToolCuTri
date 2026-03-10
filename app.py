@@ -933,30 +933,26 @@ def main():
         transition: all 0.2s ease;
         box-shadow: 0 4px 14px rgba(57,73,171,0.35);
     }
-    div[data-testid="stButton"] > button:hover {
-        transform: translateY(-2px);
-        box-shadow: 0 6px 20px rgba(57,73,171,0.5);
+    /* Sidebar Buttons */
+    section[data-testid="stSidebar"] .stButton button {
+        border-radius: 8px !important;
+        font-weight: 500 !important;
     }
 
-    .stDownloadButton > button {
-        background: linear-gradient(135deg, #2e7d32, #43a047) !important;
-        color: white !important;
-        border: none !important;
-        border-radius: 10px !important;
-        width: 100% !important;
-        font-weight: 600 !important;
+    /* Red Clear Buttons */
+    .clear-btn div[data-testid="stButton"] button {
+        background: white !important;
+        color: #d32f2f !important;
+        border: 1px solid #ffcdd2 !important;
+        font-size: 0.85rem !important;
+        margin-top: -8px !important;
     }
-
-    section[data-testid="stSidebar"] {
-        background: linear-gradient(180deg, #f8f9ff 0%, #eff1ff 100%);
-    }
-
-    /* Compact buttons in sidebar */
-    div[data-testid="stSidebar"] div[data-testid="stButton"] > button {
-        height: auto;
-        padding-top: 0.4rem;
-        padding-bottom: 0.4rem;
-        font-size: 0.85rem;
+    .clear-btn div[data-testid="stButton"] button:hover {
+        background: #fff5f5 !important;
+        border-color: #d32f2f !important;
+        color: #b71c1c !important;
+        transform: none !important;
+        box-shadow: none !important;
     }
     </style>
     """, unsafe_allow_html=True)
@@ -1004,9 +1000,11 @@ def main():
             )
             if uploaded_sources:
                 st.success(f"✅ Đã chọn {len(uploaded_sources)} file")
-                if st.button("🗑️ Xoá tất cả file nguồn", key="clear_source"):
+                st.markdown('<div class="clear-btn">', unsafe_allow_html=True)
+                if st.button("🗑️ Xoá tất cả file nguồn", key="clear_source", use_container_width=True):
                     st.session_state.source_key += 1
                     st.rerun()
+                st.markdown('</div>', unsafe_allow_html=True)
 
             st.markdown("### 📊 File tổng hợp")
             uploaded_summary = st.file_uploader(
@@ -1018,9 +1016,11 @@ def main():
             )
             if uploaded_summary:
                 st.success(f"✅ Đã chọn: {uploaded_summary.name}")
-                if st.button("🗑️ Xoá file tổng hợp", key="clear_summary"):
+                st.markdown('<div class="clear-btn">', unsafe_allow_html=True)
+                if st.button("🗑️ Xoá file tổng hợp", key="clear_summary", use_container_width=True):
                     st.session_state.summary_key += 1
                     st.rerun()
+                st.markdown('</div>', unsafe_allow_html=True)
 
         else:
             st.markdown("### 📁 Nguồn dữ liệu")
