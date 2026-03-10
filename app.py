@@ -461,31 +461,54 @@ def count_voter_stats(ws: openpyxl.worksheet.worksheet.Worksheet) -> dict:
     return stats
 
 
+def _has_voter_headers(ws: openpyxl.worksheet.worksheet.Worksheet) -> bool:
+    """Kiểm tra xem sheet có chứa các cột tiêu chuẩn của danh sách cử tri không."""
+    reqs = ["stt", "ho va ten", "ngay", "nam", "nu", "can cuoc"]
+    for row in ws.iter_rows(min_row=1, max_row=25, values_only=True):
+        row_str = " ".join([normalize_text(str(c)) for c in row if c])
+        # Cần ít nhất 4 từ khóa để xác nhận
+        if sum(1 for req in reqs if req in row_str) >= 4:
+            return True
+    return False
+
 def _find_voter_list_sheet(wb: openpyxl.Workbook):
     """
     Find the best voter-list sheet to scan for 'x' marks.
     Priority order:
-      1. Sheet named 'Tổng Hợp' / 'Tổng hợp cử tri' (aggregate list with all rows)
-      2. Sheet named 'Tổng' (combined total list)
-      3. Any other non-summary sheet that contains DOB data
-    Returns a Worksheet or None.
+      1. Sheet named 'Tổng Hợp' / 'Tổng hợp cử tri'
+      2. Sheet named 'Tổng' / 'Biểu tổng'
+    MUST strictly contain actual voter table headers.
     """
-    # Build ordered search list: named 'tong hop' first, then 'tong', then others
     named_tong_hop, named_tong, others = [], [], []
     for sheetname in wb.sheetnames:
         n = normalize_text(sheetname)
+        # Bỏ qua các sheet Tổ Cụ Thể (Tổ 1, Tổ 2...)
+        if "to " in n and "tong" not in n:
+            continue
+            
         if "tong hop" in n:
             named_tong_hop.append(sheetname)
-        elif n in {"tong", "sheet tong"} or (n.startswith("tong") and "hop" not in n):
+        elif "tong" in n:
             named_tong.append(sheetname)
         else:
             others.append(sheetname)
 
-    for sheetname in named_tong_hop + named_tong + others:
+    # Chỉ quét các sheet Tổng
+    for sheetname in named_tong_hop + named_tong:
         ws = wb[sheetname]
-        for row in ws.iter_rows(min_row=1, max_row=50, values_only=True):
-            if _parse_dob(row[2] if len(row) > 2 else None):
-                return ws   # found a sheet with DOB data
+        if _has_voter_headers(ws):
+            for row in ws.iter_rows(min_row=1, max_row=50, values_only=True):
+                if _parse_dob(row[2] if len(row) > 2 else None):
+                    return ws
+
+    # Fallback cho các file không ghi rõ chữ Tổng nhưng có bảng
+    for sheetname in others:
+        ws = wb[sheetname]
+        if _has_voter_headers(ws):
+            for row in ws.iter_rows(min_row=1, max_row=50, values_only=True):
+                if _parse_dob(row[2] if len(row) > 2 else None):
+                    return ws
+    
     return None
 
 
