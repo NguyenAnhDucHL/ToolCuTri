@@ -370,23 +370,59 @@ def _is_x(val) -> bool:
     return "x" in str(val).lower()
 
 
+def _detect_voter_columns(ws: openpyxl.worksheet.worksheet.Worksheet) -> dict:
+    """
+    Scans the top of the worksheet to find the indices of the standard columns.
+    Returns a dict mapping internal names to column indices.
+    """
+    mapping = {
+        "name": 1,   # Default B
+        "dob": 2,    # Default C
+        "nam": 3,    # Default D
+        "nu": 4,     # Default E
+        "cccd": 5,   # Default F
+        "qh": 10,    # Default K
+        "tinh": 11,  # Default L
+        "xa": 12,    # Default M
+    }
+    
+    # We look for keywords in the first 25 rows
+    for row in ws.iter_rows(min_row=1, max_row=25, values_only=True):
+        row_norm = [normalize_text(str(c)) if c is not None else "" for c in row]
+        
+        for col_idx, cell_text in enumerate(row_norm):
+            if "ho va ten" in cell_text or "ho ten" in cell_text:
+                mapping["name"] = col_idx
+            elif "ngay thang nam sinh" in cell_text or "ngay sinh" in cell_text:
+                mapping["dob"] = col_idx
+            elif cell_text == "nam":
+                mapping["nam"] = col_idx
+            elif cell_text == "nu":
+                mapping["nu"] = col_idx
+            elif "can cuoc" in cell_text or "cccd" in cell_text:
+                mapping["cccd"] = col_idx
+            elif "dbqh" in cell_text or "quoc hoi" in cell_text:
+                mapping["qh"] = col_idx
+            elif "hdnd tinh" in cell_text or "tinh," in cell_text:
+                mapping["tinh"] = col_idx
+            elif "hdnd xa" in cell_text or "xa," in cell_text or "phuong," in cell_text:
+                mapping["xa"] = col_idx
+
+    return mapping
+
+def _has_voter_headers(ws: openpyxl.worksheet.worksheet.Worksheet) -> bool:
+    """Kiểm tra xem sheet có chứa các cột tiêu chuẩn của danh sách cử tri không."""
+    reqs = ["stt", "ho va ten", "ngay", "nam", "nu"]
+    # We look for a row that contains enough keywords
+    for row in ws.iter_rows(min_row=1, max_row=25, values_only=True):
+        row_str = " ".join([normalize_text(str(c)) for c in row if c is not None])
+        if sum(1 for req in reqs if req in row_str) >= 3:
+            return True
+    return False
+
 def count_voter_stats(ws: openpyxl.worksheet.worksheet.Worksheet) -> dict:
     """
-    Scan ONE voter-list sheet (Tổng or Tổng Hợp) and return ALL stats in one pass.
-
-    Column layout (1-based):
-      A(1) = STT       B(2) = Họ tên   C(3) = Ngày sinh
-      D(4) = Nam (x)   E(5) = Nữ  (x)
-      K(11) = Bầu ĐBQH (x)
-      L(12) = Bầu HĐND tỉnh (x)
-      M(13) = Bầu HĐND phường/xã (x)
-
-    Returns:
-      tong, nam, nu       → for columns F, G, H
-      ct18, elderly       → for columns K, L in summary
-      qh_total/nam/nu     → for columns M, N, O
-      tinh_total/nam/nu   → for columns P, Q, R
-      xa_total/nam/nu     → for columns S, T, U
+    Count voters in a specific sheet by scanning columns based on detected headers.
     """
     stats = dict(
         tong=0,  nam=0,  nu=0,
@@ -396,37 +432,37 @@ def count_voter_stats(ws: openpyxl.worksheet.worksheet.Worksheet) -> dict:
         xa_total=0,   xa_nam=0,   xa_nu=0,
     )
 
-    DOB_18_FROM = datetime.date(2007, 3, 16)
-    DOB_18_TO   = datetime.date(2008, 3, 15)
-    DOB_80_CUT  = datetime.date(1946, 3, 16)
+    cols = _detect_voter_columns(ws)
+    
+    DOB_18_START = datetime.date(2007, 3, 16)
+    DOB_18_END   = datetime.date(2008, 3, 15)
+    DOB_ELDERLY  = datetime.date(1946, 3, 16)
 
-    # ── Find data start: first row where col C has a valid DOB ───────────────
+    # ── Find data start: first row where dob column has a valid DOB
     data_start = 19
     for idx, row in enumerate(ws.iter_rows(min_row=1, max_row=50, values_only=True)):
-        if _parse_dob(row[2] if len(row) > 2 else None):
+        if _parse_dob(row[cols["dob"]] if len(row) > cols["dob"] else None):
             data_start = idx + 1
             break
 
     # ── Single pass over all voter rows ─────────────────────────────────────
     for row in ws.iter_rows(min_row=data_start, values_only=True):
         # Stop at footer (e.g. "Tổng số cử tri", "Người lập biểu")
-        col_b = normalize_text(str(row[1] if len(row) > 1 else ""))
-        if _STOP_KEYWORDS.search(col_b):
+        col_name_val = str(row[cols["name"]] if len(row) > cols["name"] else "")
+        col_b_norm = normalize_text(col_name_val)
+        if _STOP_KEYWORDS.search(col_b_norm):
             break
 
-        # We shouldn't skip the row purely because DOB parsing fails. 
-        # Sometimes DOB is malformed (e.g. "1975", "28//2004"). 
-        # Check if they have a name in col B OR some raw text in col C
-        has_name = bool(str(row[1]).strip()) if len(row) > 1 and row[1] else False
-        has_raw_dob = bool(str(row[2]).strip()) if len(row) > 2 and row[2] else False
+        has_name = bool(col_name_val.strip())
+        has_raw_dob = bool(str(row[cols["dob"]]).strip()) if len(row) > cols["dob"] and row[cols["dob"]] else False
         
-        dob = _parse_dob(row[2] if len(row) > 2 else None)
+        dob = _parse_dob(row[cols["dob"]] if len(row) > cols["dob"] else None)
         
         if not has_name and not has_raw_dob:
-            continue   # not a voter row (both name and DOB are completely empty)
+            continue
 
-        co_nam = _is_x(row[3] if len(row) > 3 else None)   # D = Nam
-        co_nu  = _is_x(row[4] if len(row) > 4 else None)   # E = Nữ
+        co_nam = _is_x(row[cols["nam"]] if len(row) > cols["nam"] else None)
+        co_nu  = _is_x(row[cols["nu"]] if len(row) > cols["nu"] else None)
 
         # ── F, G, H: total count ────────────────────────────────────────────
         stats["tong"] += 1
@@ -435,15 +471,15 @@ def count_voter_stats(ws: openpyxl.worksheet.worksheet.Worksheet) -> dict:
 
         # ── Age groups (K, L in summary) ────────────────────────────────────
         if dob:
-            if DOB_18_FROM <= dob <= DOB_18_TO:
+            if DOB_18_START <= dob <= DOB_18_END:
                 stats["ct18"] += 1
-            if dob < DOB_80_CUT:
+            if dob <= DOB_ELDERLY:
                 stats["elderly"] += 1
 
         # ── Election marks (M-U in summary) ─────────────────────────────────
-        co_qh   = _is_x(row[10] if len(row) > 10 else None)  # K = QH
-        co_tinh = _is_x(row[11] if len(row) > 11 else None)  # L = Tinh
-        co_xa   = _is_x(row[12] if len(row) > 12 else None)  # M = Phường/Xã
+        co_qh   = _is_x(row[cols["qh"]] if len(row) > cols["qh"] else None)
+        co_tinh = _is_x(row[cols["tinh"]] if len(row) > cols["tinh"] else None)
+        co_xa   = _is_x(row[cols["xa"]] if len(row) > cols["xa"] else None)
 
         if co_qh:
             stats["qh_total"] += 1
@@ -460,16 +496,6 @@ def count_voter_stats(ws: openpyxl.worksheet.worksheet.Worksheet) -> dict:
 
     return stats
 
-
-def _has_voter_headers(ws: openpyxl.worksheet.worksheet.Worksheet) -> bool:
-    """Kiểm tra xem sheet có chứa các cột tiêu chuẩn của danh sách cử tri không."""
-    reqs = ["stt", "ho va ten", "ngay", "nam", "nu", "can cuoc"]
-    for row in ws.iter_rows(min_row=1, max_row=25, values_only=True):
-        row_str = " ".join([normalize_text(str(c)) for c in row if c])
-        # Cần ít nhất 4 từ khóa để xác nhận
-        if sum(1 for req in reqs if req in row_str) >= 4:
-            return True
-    return False
 
 def _find_voter_list_sheet(wb: openpyxl.Workbook):
     """
@@ -497,16 +523,18 @@ def _find_voter_list_sheet(wb: openpyxl.Workbook):
     for sheetname in named_tong_hop + named_tong:
         ws = wb[sheetname]
         if _has_voter_headers(ws):
+            cols = _detect_voter_columns(ws)
             for row in ws.iter_rows(min_row=1, max_row=50, values_only=True):
-                if _parse_dob(row[2] if len(row) > 2 else None):
+                if _parse_dob(row[cols["dob"]] if len(row) > cols["dob"] else None):
                     return ws
 
     # Fallback cho các file không ghi rõ chữ Tổng nhưng có bảng
     for sheetname in others:
         ws = wb[sheetname]
         if _has_voter_headers(ws):
+            cols = _detect_voter_columns(ws)
             for row in ws.iter_rows(min_row=1, max_row=50, values_only=True):
-                if _parse_dob(row[2] if len(row) > 2 else None):
+                if _parse_dob(row[cols["dob"]] if len(row) > cols["dob"] else None):
                     return ws
     
     return None
