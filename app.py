@@ -950,6 +950,14 @@ def main():
     section[data-testid="stSidebar"] {
         background: linear-gradient(180deg, #f8f9ff 0%, #eff1ff 100%);
     }
+
+    /* Compact buttons in sidebar */
+    div[data-testid="stSidebar"] div[data-testid="stButton"] > button {
+        height: auto;
+        padding-top: 0.4rem;
+        padding-bottom: 0.4rem;
+        font-size: 0.85rem;
+    }
     </style>
     """, unsafe_allow_html=True)
 
@@ -980,22 +988,41 @@ def main():
         summary_input = ""
 
         if input_mode == "Upload file lên trực tiếp ▲":
+            # Initialize keys for resetting uploaders
+            if "source_key" not in st.session_state:
+                st.session_state.source_key = 0
+            if "summary_key" not in st.session_state:
+                st.session_state.summary_key = 0
+
             st.markdown("### 📁 Nguồn dữ liệu")
+            col_src1, col_src2 = st.columns([3, 1])
+            with col_src2:
+                if st.button("🗑️ Xoá", key="clear_source", help="Xoá tất cả file nguồn đã chọn"):
+                    st.session_state.source_key += 1
+                    st.rerun()
+
             uploaded_sources = st.file_uploader(
                 "Chọn nhiều file .xlsx nguồn (mỗi file = 1 khu phố)",
                 type=["xlsx"],
                 accept_multiple_files=True,
+                key=f"source_uploader_{st.session_state.source_key}",
                 help="Chọn tất cả file .xlsx của các khu phố cùng lúc"
             )
             if uploaded_sources:
                 st.success(f"✅ Đã chọn {len(uploaded_sources)} file")
 
             st.markdown("### 📊 File tổng hợp")
+            col_sum1, col_sum2 = st.columns([3, 1])
+            with col_sum2:
+                if st.button("🗑️ Xoá", key="clear_summary", help="Xoá file tổng hợp đã chọn"):
+                    st.session_state.summary_key += 1
+                    st.rerun()
+
             uploaded_summary = st.file_uploader(
                 "Chọn file BIỂU TỔNG HỢP.xlsx",
                 type=["xlsx"],
                 accept_multiple_files=False,
-                key="summary_uploader",
+                key=f"summary_uploader_{st.session_state.summary_key}",
                 help="File này sẽ được cập nhật cột F, G, H, K, L"
             )
             if uploaded_summary:
