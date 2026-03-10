@@ -504,22 +504,24 @@ def count_voter_stats(ws: openpyxl.worksheet.worksheet.Worksheet) -> dict:
 
         # ── Tổng số cử tri = số X ở cột ĐBQH (K) ────────────────────────────
         # (Tổng số cử tri chính là những người bầu ĐBQH tại đây)
-        stats["tong"] += 1
-        if co_nam: stats["nam"] += 1
-        if co_nu:  stats["nu"]  += 1
-
-        # ── Age groups: chỉ tính người có election marks ─────────────────────
-        if dob:
-            if DOB_18_START <= dob <= DOB_18_END:
-                stats["ct18"] += 1
-            if dob <= DOB_ELDERLY:
-                stats["elderly"] += 1
-
-        # ── Election sub-totals ──────────────────────────────────────────────
         if co_qh:
+            stats["tong"] += 1
+            if co_nam: stats["nam"] += 1
+            if co_nu:  stats["nu"]  += 1
+
+            # ── Age groups: chỉ tính người có trong tổng số cử tri ──────────
+            if dob:
+                if DOB_18_START <= dob <= DOB_18_END:
+                    stats["ct18"] += 1
+                if dob <= DOB_ELDERLY:
+                    stats["elderly"] += 1
+
+            # ── ĐBQH sub-totals ─────────────────────────────────────────────
             stats["qh_total"] += 1
             if co_nam: stats["qh_nam"] += 1
             if co_nu:  stats["qh_nu"]  += 1
+
+        # ── Election sub-totals (Tỉnh, Xã) ──────────────────────────────────
         if co_tinh:
             stats["tinh_total"] += 1
             if co_nam: stats["tinh_nam"] += 1
