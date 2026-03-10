@@ -374,6 +374,7 @@ def _detect_voter_columns(ws: openpyxl.worksheet.worksheet.Worksheet) -> dict:
     """
     Scans the top of the worksheet to find the indices of the standard columns.
     Returns a dict mapping internal names to column indices.
+    Only considers cells with short text (<=40 chars) as potential headers.
     """
     mapping = {
         "name": 1,   # Default B
@@ -381,9 +382,9 @@ def _detect_voter_columns(ws: openpyxl.worksheet.worksheet.Worksheet) -> dict:
         "nam": 3,    # Default D
         "nu": 4,     # Default E
         "cccd": 5,   # Default F
-        "qh": 10,    # Default K
-        "tinh": 11,  # Default L
-        "xa": 12,    # Default M
+        "qh": None,  # Bầu cử ĐBQH
+        "tinh": None,# Bầu cử HĐND Tỉnh
+        "xa": None,  # Bầu cử HĐND Phường/Xã
     }
     
     # We look for keywords in the first 25 rows
@@ -391,6 +392,9 @@ def _detect_voter_columns(ws: openpyxl.worksheet.worksheet.Worksheet) -> dict:
         row_norm = [normalize_text(str(c)) if c is not None else "" for c in row]
         
         for col_idx, cell_text in enumerate(row_norm):
+            # Skip long text (title cells, merged descriptions, etc.)
+            if len(cell_text) > 40:
+                continue
             if "ho va ten" in cell_text or "ho ten" in cell_text:
                 mapping["name"] = col_idx
             elif "ngay thang nam sinh" in cell_text or "ngay sinh" in cell_text:
@@ -401,28 +405,57 @@ def _detect_voter_columns(ws: openpyxl.worksheet.worksheet.Worksheet) -> dict:
                 mapping["nu"] = col_idx
             elif "can cuoc" in cell_text or "cccd" in cell_text:
                 mapping["cccd"] = col_idx
-            elif "dbqh" in cell_text or "quoc hoi" in cell_text:
+            elif "dbqh" in cell_text:
                 mapping["qh"] = col_idx
-            elif "hdnd tinh" in cell_text or "tinh," in cell_text:
+            elif cell_text == "tinh" or "hdnd tinh" in cell_text:
                 mapping["tinh"] = col_idx
-            elif "hdnd xa" in cell_text or "xa," in cell_text or "phuong," in cell_text:
+            elif cell_text == "phuong" or "hdnd xa" in cell_text or "hdnd phuong" in cell_text:
                 mapping["xa"] = col_idx
+
+    # If ĐBQH column was not found via header text, look for (8), (9), (10) sub-headers
+    if mapping["qh"] is None:
+        for row in ws.iter_rows(min_row=1, max_row=25, values_only=True):
+            row_norm = [normalize_text(str(c)) if c is not None else "" for c in row]
+            for col_idx, cell_text in enumerate(row_norm):
+                if cell_text.strip() == "(8)":
+                    mapping["qh"] = col_idx
+                elif cell_text.strip() == "(9)":
+                    if mapping["tinh"] is None:
+                        mapping["tinh"] = col_idx
+                elif cell_text.strip() == "(10)":
+                    if mapping["xa"] is None:
+                        mapping["xa"] = col_idx
+
+    # Final fallback: if still no election columns found, use defaults
+    if mapping["qh"] is None:
+        mapping["qh"] = 10    # Default K
+    if mapping["tinh"] is None:
+        mapping["tinh"] = 11  # Default L
+    if mapping["xa"] is None:
+        mapping["xa"] = 12    # Default M
 
     return mapping
 
+
 def _has_voter_headers(ws: openpyxl.worksheet.worksheet.Worksheet) -> bool:
-    """Kiểm tra xem sheet có chứa các cột tiêu chuẩn của danh sách cử tri không."""
-    reqs = ["stt", "ho va ten", "ngay", "nam", "nu"]
-    # We look for a row that contains enough keywords
+    """Kiểm tra xem sheet có chứa các cột tiêu chuẩn của danh sách cử tri không.
+    Yêu cầu: STT, Họ và tên, Ngày sinh, Nam, Nữ, Số Căn cước, Dân tộc, Nơi cư trú,
+    Bầu cử ĐBQH...
+    """
+    reqs = ["stt", "ho va ten", "ngay", "nam", "nu", "can cuoc", "dan toc"]
     for row in ws.iter_rows(min_row=1, max_row=25, values_only=True):
         row_str = " ".join([normalize_text(str(c)) for c in row if c is not None])
-        if sum(1 for req in reqs if req in row_str) >= 3:
+        if sum(1 for req in reqs if req in row_str) >= 5:
             return True
     return False
 
 def count_voter_stats(ws: openpyxl.worksheet.worksheet.Worksheet) -> dict:
     """
     Count voters in a specific sheet by scanning columns based on detected headers.
+    
+    KEY RULE: Tổng số cử tri = số dấu X ở cột Bầu cử ĐBQH (K).
+    Người không có X ở cả 3 cột K/L/M → bỏ phiếu nơi khác → không tính.
+    CT18 và cao tuổi chỉ tính người có X ở ít nhất 1 trong K/L/M.
     """
     stats = dict(
         tong=0,  nam=0,  nu=0,
@@ -433,10 +466,6 @@ def count_voter_stats(ws: openpyxl.worksheet.worksheet.Worksheet) -> dict:
     )
 
     cols = _detect_voter_columns(ws)
-    
-    DOB_18_START = datetime.date(2007, 3, 16)
-    DOB_18_END   = datetime.date(2008, 3, 15)
-    DOB_ELDERLY  = datetime.date(1946, 3, 16)
 
     # ── Find data start: first row where dob column has a valid DOB
     data_start = 19
@@ -456,31 +485,37 @@ def count_voter_stats(ws: openpyxl.worksheet.worksheet.Worksheet) -> dict:
         has_name = bool(col_name_val.strip())
         has_raw_dob = bool(str(row[cols["dob"]]).strip()) if len(row) > cols["dob"] and row[cols["dob"]] else False
         
-        dob = _parse_dob(row[cols["dob"]] if len(row) > cols["dob"] else None)
-        
         if not has_name and not has_raw_dob:
             continue
 
+        dob = _parse_dob(row[cols["dob"]] if len(row) > cols["dob"] else None)
         co_nam = _is_x(row[cols["nam"]] if len(row) > cols["nam"] else None)
         co_nu  = _is_x(row[cols["nu"]] if len(row) > cols["nu"] else None)
 
-        # ── F, G, H: total count ────────────────────────────────────────────
+        # ── Election marks ───────────────────────────────────────────────────
+        co_qh   = _is_x(row[cols["qh"]] if len(row) > cols["qh"] else None)
+        co_tinh = _is_x(row[cols["tinh"]] if len(row) > cols["tinh"] else None)
+        co_xa   = _is_x(row[cols["xa"]] if len(row) > cols["xa"] else None)
+
+        # Người không có X ở cả 3 cột K/L/M → bỏ phiếu nơi khác → bỏ qua
+        has_any_election = co_qh or co_tinh or co_xa
+        if not has_any_election:
+            continue
+
+        # ── Tổng số cử tri = số X ở cột ĐBQH (K) ────────────────────────────
+        # (Tổng số cử tri chính là những người bầu ĐBQH tại đây)
         stats["tong"] += 1
         if co_nam: stats["nam"] += 1
         if co_nu:  stats["nu"]  += 1
 
-        # ── Age groups (K, L in summary) ────────────────────────────────────
+        # ── Age groups: chỉ tính người có election marks ─────────────────────
         if dob:
             if DOB_18_START <= dob <= DOB_18_END:
                 stats["ct18"] += 1
             if dob <= DOB_ELDERLY:
                 stats["elderly"] += 1
 
-        # ── Election marks (M-U in summary) ─────────────────────────────────
-        co_qh   = _is_x(row[cols["qh"]] if len(row) > cols["qh"] else None)
-        co_tinh = _is_x(row[cols["tinh"]] if len(row) > cols["tinh"] else None)
-        co_xa   = _is_x(row[cols["xa"]] if len(row) > cols["xa"] else None)
-
+        # ── Election sub-totals ──────────────────────────────────────────────
         if co_qh:
             stats["qh_total"] += 1
             if co_nam: stats["qh_nam"] += 1
