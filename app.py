@@ -995,12 +995,6 @@ def main():
                 st.session_state.summary_key = 0
 
             st.markdown("### 📁 Nguồn dữ liệu")
-            col_src1, col_src2 = st.columns([3, 1])
-            with col_src2:
-                if st.button("🗑️ Xoá", key="clear_source", help="Xoá tất cả file nguồn đã chọn"):
-                    st.session_state.source_key += 1
-                    st.rerun()
-
             uploaded_sources = st.file_uploader(
                 "Chọn nhiều file .xlsx nguồn (mỗi file = 1 khu phố)",
                 type=["xlsx"],
@@ -1010,14 +1004,11 @@ def main():
             )
             if uploaded_sources:
                 st.success(f"✅ Đã chọn {len(uploaded_sources)} file")
-
-            st.markdown("### 📊 File tổng hợp")
-            col_sum1, col_sum2 = st.columns([3, 1])
-            with col_sum2:
-                if st.button("🗑️ Xoá", key="clear_summary", help="Xoá file tổng hợp đã chọn"):
-                    st.session_state.summary_key += 1
+                if st.button("🗑️ Xoá tất cả file nguồn", key="clear_source"):
+                    st.session_state.source_key += 1
                     st.rerun()
 
+            st.markdown("### 📊 File tổng hợp")
             uploaded_summary = st.file_uploader(
                 "Chọn file BIỂU TỔNG HỢP.xlsx",
                 type=["xlsx"],
@@ -1027,6 +1018,9 @@ def main():
             )
             if uploaded_summary:
                 st.success(f"✅ Đã chọn: {uploaded_summary.name}")
+                if st.button("🗑️ Xoá file tổng hợp", key="clear_summary"):
+                    st.session_state.summary_key += 1
+                    st.rerun()
 
         else:
             st.markdown("### 📁 Nguồn dữ liệu")
