@@ -578,7 +578,7 @@ def _find_voter_list_sheet(wb: openpyxl.Workbook):
 
 
 @st.cache_data(show_spinner=False, ttl=3600*24)
-def _process_source_bytes(file_bytes: bytes) -> dict:
+def _process_source_bytes_v2(file_bytes: bytes) -> dict:
     """Core logic extracted to allow robust caching based on file contents."""
     result = {
         "tong": None, "nam": None, "nu": None,
@@ -618,7 +618,7 @@ def process_source_file(filepath: str) -> dict:
     try:
         with open(filepath, "rb") as f:
             file_bytes = f.read()
-        return _process_source_bytes(file_bytes)
+        return _process_source_bytes_v2(file_bytes)
     except Exception as e:
         return {"error": f"Lỗi đọc file từ đĩa: {e}"}
 
